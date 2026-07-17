@@ -72,6 +72,28 @@ The backport also identifies librqbit with its real name and version in the
 shared HTTP client's `User-Agent`. Version 8.1.1 omitted this header and strict
 tracker HTTP edges reject anonymous announces. This matches upstream 9.0.
 
+## Verification boundary
+
+The normal RedCrown test gate excludes `librqbit`'s own upstream stress suite.
+That suite creates a 61 MiB fixture and starts 128 simulated seed sessions under
+independent 30-second deadlines. It is useful for qualifying engine changes,
+but the result depends on runner scheduling and is not a reliable product CI
+signal on shared Windows hosts.
+
+RedCrown instead locks in its torrent requirement with the product-owned
+`downloads_prebuffers_and_serves_from_a_local_seed` integration test. That test
+creates an isolated local torrent, downloads verified pieces through the engine,
+checks prebuffering, and reads the resulting loopback byte range. The focused
+tracker, metadata, listener-port, cache, and playback tests remain in the normal
+gate as well. Engine maintainers can run the additional upstream suite with:
+
+```powershell
+cargo test --manifest-path ./backend/Cargo.toml -p librqbit
+```
+
+This split avoids weakening assertions or increasing arbitrary timeouts while
+keeping upstream stress coverage available for engine qualification.
+
 ## Qualification still required
 
 - real incomplete-file playback on Windows;

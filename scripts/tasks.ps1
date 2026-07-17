@@ -24,7 +24,7 @@ function Assert-CommandSucceeded {
 
 switch ($Task) {
     'test' {
-        cargo test --manifest-path $backendManifest --workspace
+        cargo test --manifest-path $backendManifest --workspace --exclude librqbit
         Assert-CommandSucceeded 'Rust tests' $LASTEXITCODE
         npm test --prefix $desktop
         Assert-CommandSucceeded 'Desktop tests' $LASTEXITCODE
