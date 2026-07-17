@@ -1,0 +1,36 @@
+[package]
+name = "librqbit-upnp"
+version = "1.0.0"
+edition = "2021"
+authors = ["Igor Katson <igor.katson@gmail.com>"]
+description = "Library used by rqbit torrent client to lease port forwards on the router."
+documentation = "https://docs.rs/librqbit-upnp"
+readme = "README.md"
+license = "Apache-2.0"
+repository = "https://github.com/ikatson/rqbit"
+publish = false
+
+[dependencies]
+anyhow = "1"
+bstr = "1.10.0"
+futures = "0.3"
+httparse = "1.9.4"
+network-interface = "2"
+quick-xml = { version = "0.41", features = ["serialize"] }
+reqwest = { version = "0.12", default-features = false }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros"] }
+tracing = "0.1"
+url = { version = "2", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = "0.3"
+
+[[example]]
+name = "discover"
+path = "examples/discover.rs"
+
+[[example]]
+name = "upnp-forward"
+path = "examples/upnp-forward.rs"

@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>RedCrown</title>
+  <defs>
+    <linearGradient id="shield" x1="10" y1="7" x2="53" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ff5c74"/>
+      <stop offset=".52" stop-color="#e93455"/>
+      <stop offset="1" stop-color="#a90f32"/>
+    </linearGradient>
+    <linearGradient id="crown" x1="19" y1="18" x2="43" y2="45" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fff"/>
+      <stop offset="1" stop-color="#ffe8ec"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-15%" width="140%" height="145%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2.2" flood-color="#620019" flood-opacity=".32"/>
+    </filter>
+  </defs>
+  <g transform="translate(0 -1)">
+    <path
+      fill="url(#shield)"
+      d="M32 3 53 11v18c0 14.1-8.5 25.7-21 32C19.5 54.7 11 43.1 11 29V11L32 3Z"
+    />
+    <path
+      fill="none"
+      stroke="#ff91a2"
+      stroke-opacity=".42"
+      stroke-width="1.5"
+      d="M32 5.7 50.5 12.8V29c0 12.5-7.2 22.8-18.5 28.9C20.7 51.8 13.5 41.5 13.5 29V12.8L32 5.7Z"
+    />
+    <g filter="url(#shadow)">
+      <path
+        fill="url(#crown)"
+        d="m17.5 23.2 9.1 6.6L32 17l5.4 12.8 9.1-6.6-3.2 18.1H20.7l-3.2-18.1Z"
+      />
+      <path fill="#fff" d="M20.7 43.4h22.6v4.2H20.7z"/>
+      <circle cx="32" cy="34.8" r="2.6" fill="#d92148"/>
+    </g>
+  </g>
+</svg>

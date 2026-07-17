@@ -1,0 +1,39 @@
+# Rust build output
+/backend/target/
+/backend/target-*/
+**/*.rs.bk
+
+# Node and frontend build output
+/apps/desktop/node_modules/
+/apps/desktop/dist/
+/apps/desktop/.vite/
+/apps/desktop/coverage/
+*.tsbuildinfo
+
+# RedCrown runtime state and downloaded tools
+/.redcrown/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+.npmrc
+!.npmrc.example
+.cargo/credentials
+.cargo/credentials.toml
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak

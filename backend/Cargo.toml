@@ -1,0 +1,83 @@
+[workspace]
+members = [
+    "crates/redcrown-core",
+    "crates/redcrown-catalog",
+    "crates/redcrown-torrent",
+    "crates/redcrown-library",
+    "crates/redcrown-diagnostics",
+    "crates/redcrown-desktop",
+    "third_party/librqbit",
+    "third_party/librqbit-tracker-comms",
+    "third_party/librqbit-upnp",
+    "third_party/librqbit-upnp-serve",
+]
+resolver = "2"
+
+[patch.crates-io]
+# librqbit 8.1.1 discards tracker URL query parameters. The documented,
+# regression-tested backport is maintained under third_party until a stable
+# upstream librqbit release includes the fix.
+librqbit-tracker-comms = { path = "third_party/librqbit-tracker-comms" }
+librqbit = { path = "third_party/librqbit" }
+librqbit-upnp = { path = "third_party/librqbit-upnp" }
+librqbit-upnp-serve = { path = "third_party/librqbit-upnp-serve" }
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+publish = false
+rust-version = "1.88"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = "0.8"
+backtrace = "0.3"
+http = "1.3"
+directories = "6.0"
+librqbit = { version = "=8.1.1", default-features = false, features = ["default-tls"] }
+mimalloc = "0.1"
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "default-tls"] }
+reqwest-otel = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "native-tls"] }
+rusqlite = { version = "=0.39.0", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.20"
+thiserror = "2.0"
+tokio = { version = "1.46", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+tracing-opentelemetry = { version = "0.33", default-features = false }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = { version = "2.5", features = ["serde"] }
+uuid = { version = "1.17", features = ["serde", "v4"] }
+
+[workspace.lints.rust]
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+cargo = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+multiple_crate_versions = "allow"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+debug = 1
