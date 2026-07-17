@@ -5,9 +5,9 @@ and a sandboxed Electron/React interface. It is designed around temporary,
 expiring stream cache rather than permanent downloads.
 
 > [!IMPORTANT]
-> RedCrown is under active development. There are no supported releases yet,
-> and installer packaging, signed updates, and broader real-network
-> qualification are still in progress.
+> RedCrown is under active development. Published builds are unsigned
+> pre-releases; signed updates and broader real-network qualification are still
+> in progress.
 
 ## What is implemented
 
@@ -74,6 +74,18 @@ compatible API base URLs in fallback order, select **Test all**, and then
 **Save**. Once at least one source is configured and returns catalog rows, the
 app opens Home. Configuration is stored in the operating system's per-user
 application-data directory, never in the repository checkout.
+
+## Pre-release builds
+
+Windows installer and ZIP builds are published on the
+[GitHub Releases](https://github.com/redcrownlabs/RedCrown/releases) page with a
+`SHA256SUMS.txt` integrity manifest. They contain the Rust backend and the pinned
+shared FFmpeg runtime, so FFmpeg does not need to be installed separately.
+
+The current builds are not code-signed. Windows may show an unknown-publisher
+warning; verify the downloaded artifact against the attached SHA-256 manifest.
+The release design and promotion process are documented in
+[docs/release-process.md](docs/release-process.md).
 
 Run the same checks used by continuous integration:
 

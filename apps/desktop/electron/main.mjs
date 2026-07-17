@@ -1,6 +1,7 @@
 import { app, BrowserWindow, ipcMain } from "electron";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,10 +14,22 @@ let backendReady;
 let pending = new Map();
 
 function backendPath() {
+  if (app.isPackaged) {
+    return join(process.resourcesPath, "bin", "redcrown-backend.exe");
+  }
   if (process.env.REDCROWN_BACKEND_BIN) {
     return process.env.REDCROWN_BACKEND_BIN;
   }
   return join(root, "..", "..", "..", "backend", "target", "debug", "redcrown-desktop.exe");
+}
+
+function backendEnvironment() {
+  if (!app.isPackaged) return process.env;
+  return {
+    ...process.env,
+    REDCROWN_FFMPEG_BIN: join(process.resourcesPath, "ffmpeg", "ffmpeg.exe"),
+    REDCROWN_FFPROBE_BIN: join(process.resourcesPath, "ffmpeg", "ffprobe.exe"),
+  };
 }
 
 function rejectPending(message) {
@@ -28,7 +41,12 @@ function rejectPending(message) {
 }
 
 function startBackend() {
-  backend = spawn(backendPath(), [], {
+  const executable = backendPath();
+  if (!existsSync(executable)) {
+    throw new Error(`Backend executable is missing: ${executable}`);
+  }
+  backend = spawn(executable, [], {
+    env: backendEnvironment(),
     windowsHide: true,
     stdio: ["pipe", "pipe", "pipe"],
   });

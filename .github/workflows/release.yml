@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-release:
+    name: Build Windows release
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Require a version tag
+        shell: pwsh
+        run: |
+          if (-not '${{ github.ref }}'.StartsWith('refs/tags/v')) {
+            throw 'Release publishing requires a v-prefixed tag.'
+          }
+          $packageVersion = node -p "require('./apps/desktop/package.json').version"
+          if ('${{ github.ref_name }}' -ne "v$packageVersion") {
+            throw "Tag ${{ github.ref_name }} does not match package version $packageVersion."
+          }
+
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.88.0
+
+      - name: Install desktop dependencies
+        run: npm ci --prefix ./apps/desktop
+
+      - name: Build and verify release artifacts
+        run: ./scripts/package-win.ps1
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: RedCrown-${{ github.ref_name }}-windows
+          path: |
+            apps/desktop/release/*.exe
+            apps/desktop/release/*.zip
+            apps/desktop/release/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub pre-release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = Get-ChildItem ./apps/desktop/release -File |
+            Where-Object { $_.Extension -in '.exe', '.zip', '.txt' } |
+            ForEach-Object FullName
+          gh release create '${{ github.ref_name }}' $assets `
+            --verify-tag `
+            --prerelease `
+            --generate-notes `
+            --title "RedCrown ${{ github.ref_name }}"

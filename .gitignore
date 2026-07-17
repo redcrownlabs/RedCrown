@@ -6,6 +6,7 @@
 # Node and frontend build output
 /apps/desktop/node_modules/
 /apps/desktop/dist/
+/apps/desktop/release/
 /apps/desktop/.vite/
 /apps/desktop/coverage/
 *.tsbuildinfo
