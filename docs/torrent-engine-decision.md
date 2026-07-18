@@ -72,6 +72,23 @@ The backport also identifies librqbit with its real name and version in the
 shared HTTP client's `User-Agent`. Version 8.1.1 omitted this header and strict
 tracker HTTP edges reject anonymous announces. This matches upstream 9.0.
 
+### Supplemental tracker-list import
+
+Trackerless magnets depend entirely on DHT, which is less reliable on Windows
+while the upstream UDP error-10054 issue remains unresolved. RedCrown therefore
+imports a bounded, user-configurable public tracker list from HTTPS or an
+absolute local file and applies it only to magnets that contain no tracker.
+
+The list is capped at 1 MiB and 512 unique HTTP, HTTPS, or UDP URLs. A matching
+last-known-good copy is retained in the stream cache and the source refreshes
+daily. Existing magnet trackers and `.torrent` files are never supplemented,
+which avoids leaking private swarm hashes to unrelated public trackers.
+
+`librqbit` 8.1.1 ignores `AddTorrentOptions::trackers` for magnet inputs, so the
+vendored engine includes a focused backport that merges those custom trackers
+during magnet parsing. The invariant is that an application-supplied tracker
+must participate in metadata discovery without rewriting the magnet URI.
+
 ## Verification boundary
 
 The normal RedCrown test gate excludes `librqbit`'s own upstream stress suite.

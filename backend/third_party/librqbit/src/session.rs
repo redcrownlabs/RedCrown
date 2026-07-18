@@ -466,6 +466,13 @@ fn torrent_file_from_info_bytes(info_bytes: &[u8], trackers: &[url::Url]) -> any
     Ok(w.into())
 }
 
+fn parse_tracker_urls<'a>(trackers: impl IntoIterator<Item = &'a str>) -> Vec<url::Url> {
+    trackers
+        .into_iter()
+        .filter_map(|tracker| url::Url::parse(tracker).ok())
+        .collect()
+}
+
 pub(crate) struct CheckedIncomingConnection {
     pub addr: SocketAddr,
     pub stream: tokio::net::TcpStream,
@@ -920,13 +927,17 @@ impl Session {
                         }
                     }
 
+                    let custom_trackers = opts.trackers.as_deref().unwrap_or_default();
+                    let trackers = parse_tracker_urls(
+                        magnet
+                            .trackers
+                            .iter()
+                            .map(String::as_str)
+                            .chain(custom_trackers.iter().map(String::as_str)),
+                    );
                     InternalAddResult {
                         info_hash,
-                        trackers: magnet
-                            .trackers
-                            .into_iter()
-                            .filter_map(|t| url::Url::parse(&t).ok())
-                            .collect(),
+                        trackers,
                         metadata: None,
                         name: magnet.name,
                     }
@@ -1582,7 +1593,8 @@ mod tests {
     use librqbit_core::torrent_metainfo::{torrent_from_bytes_ext, TorrentMetaV1};
 
     use super::{
-        generate_tracker_safe_peer_id, peer_discovery_announce_ports, torrent_file_from_info_bytes,
+        generate_tracker_safe_peer_id, parse_tracker_urls, peer_discovery_announce_ports,
+        torrent_file_from_info_bytes,
     };
 
     #[test]
@@ -1608,6 +1620,15 @@ mod tests {
             peer_discovery_announce_ports(Some(49_152), true),
             (Some(49_152), Some(49_152))
         );
+    }
+
+    #[test]
+    fn custom_tracker_urls_can_supplement_trackerless_magnets() {
+        let configured = ["udp://tracker.example:80/announce"];
+        let trackers = parse_tracker_urls(configured);
+
+        assert_eq!(trackers.len(), 1);
+        assert_eq!(trackers[0].scheme(), "udp");
     }
 
     #[test]

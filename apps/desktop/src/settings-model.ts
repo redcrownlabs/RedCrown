@@ -1,4 +1,9 @@
-import type { AppSettings, SourceConfig, SourceEndpoint } from "./contract.generated";
+import type {
+  AppSettings,
+  SourceConfig,
+  SourceEndpoint,
+  TrackerListConfig,
+} from "./contract.generated";
 
 export function hasConfiguredCatalog(settings: AppSettings): boolean {
   return settings.sources.some(
@@ -42,4 +47,23 @@ export function validateSource(source: SourceConfig): string | undefined {
     return error instanceof Error ? error.message : "Invalid API URL";
   }
   return undefined;
+}
+
+export function validateTrackerList(config: TrackerListConfig): string | undefined {
+  if (!config.enabled) return undefined;
+  if (config.source.kind === "file") {
+    const path = config.source.path.trim();
+    if (!/^(?:[a-zA-Z]:[\\/]|\\\\)/.test(path)) {
+      return "Use an absolute local file path";
+    }
+    return undefined;
+  }
+  try {
+    const url = new URL(config.source.url.trim());
+    if (url.protocol !== "https:") return "Tracker-list URL must use HTTPS";
+    if (url.username || url.password) return "Credentials are not allowed in tracker-list URLs";
+    return undefined;
+  } catch {
+    return "Enter a valid tracker-list URL";
+  }
 }

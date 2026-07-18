@@ -8,11 +8,12 @@ use std::process::Stdio;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use librqbit::api::TorrentIdOrHash;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, CreateTorrentOptions, Session,
     SessionOptions, create_torrent,
 };
-use redcrown_core::StreamCachePolicy;
+use redcrown_core::{StreamCachePolicy, TrackerListConfig};
 use tempfile::tempdir;
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -24,6 +25,78 @@ use super::{MediaTools, PlaybackPreparation, PlaybackStage, PreparationSnapshot,
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 const TEST_FILE_BYTES: usize = 1024 * 1024;
 const TEST_PIECE_BYTES: u32 = 64 * 1024;
+const EXTERNAL_MAGNET_TIMEOUT: Duration = Duration::from_secs(180);
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "run through scripts/test-magnet.ps1 with an explicit public magnet"]
+async fn resolves_and_downloads_from_external_magnet() -> Result<(), Box<dyn Error>> {
+    let magnet = std::env::var("REDCROWN_TEST_MAGNET")?;
+    let client_root = tempdir()?;
+    let engine = TorrentEngine::start(
+        client_root.path().to_path_buf(),
+        StreamCachePolicy::standard(),
+        TrackerListConfig::default(),
+        MediaTools::unavailable_for_transfer_test(),
+    )
+    .await?;
+
+    let listed = timeout(EXTERNAL_MAGNET_TIMEOUT, engine.resolve_metadata(&magnet)).await??;
+    let ticket = timeout(
+        EXTERNAL_MAGNET_TIMEOUT,
+        engine.start_resolved_playback(listed, None),
+    )
+    .await??;
+    let handle = engine
+        .api
+        .mgr_handle(TorrentIdOrHash::Id(ticket.torrent_id))?;
+    timeout(EXTERNAL_MAGNET_TIMEOUT, handle.wait_until_initialized()).await??;
+    let client = reqwest::Client::builder().build()?;
+    let mut response = client
+        .get(&ticket.stream_url)
+        .header(reqwest::header::RANGE, "bytes=0-262143")
+        .send()
+        .await?;
+    let stream_status = response.status();
+    if !stream_status.is_success() {
+        let bytes = response.bytes().await?;
+        return Err(format!(
+            "loopback stream returned {stream_status}: {}",
+            String::from_utf8_lossy(&bytes)
+        )
+        .into());
+    }
+    let mut received = 0_usize;
+    let deadline = tokio::time::Instant::now() + EXTERNAL_MAGNET_TIMEOUT;
+    while received == 0 && tokio::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(10), response.chunk()).await {
+            Ok(Ok(Some(chunk))) => received = received.saturating_add(chunk.len()),
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => {
+                let torrent_stats = handle.stats();
+                if let Some(live) = torrent_stats.live {
+                    eprintln!(
+                        "transfer pending: progress={} peers={{queued:{}, connecting:{}, live:{}, seen:{}, dead:{}, not_needed:{}}}",
+                        torrent_stats.progress_bytes,
+                        live.snapshot.peer_stats.queued,
+                        live.snapshot.peer_stats.connecting,
+                        live.snapshot.peer_stats.live,
+                        live.snapshot.peer_stats.seen,
+                        live.snapshot.peer_stats.dead,
+                        live.snapshot.peer_stats.not_needed,
+                    );
+                } else {
+                    eprintln!("transfer pending: torrent is not live");
+                }
+            }
+        }
+    }
+
+    assert!(received > 0, "the external swarm returned no media bytes");
+    engine.stop_playback(ticket.torrent_id).await?;
+    engine.shutdown().await?;
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "run through scripts/test-media.ps1 with the pinned media toolchain"]
@@ -37,6 +110,7 @@ async fn media_bridge_transcodes_audio_and_exposes_subtitles() -> Result<(), Box
     let engine = TorrentEngine::start(
         client_root.path().to_path_buf(),
         StreamCachePolicy::standard(),
+        TrackerListConfig::default(),
         tools.clone(),
     )
     .await?;
@@ -178,9 +252,7 @@ async fn probe_file(tools: &MediaTools, path: &Path) -> Result<String, Box<dyn E
 async fn downloads_prebuffers_and_serves_from_a_local_seed() -> Result<(), Box<dyn Error>> {
     let seed_root = tempdir()?;
     let media_path = seed_root.path().join("redcrown-transfer-test.mp4");
-    let expected = (0..TEST_FILE_BYTES)
-        .map(|offset| u8::try_from(offset % 251))
-        .collect::<Result<Vec<_>, _>>()?;
+    let expected = transfer_fixture_bytes()?;
     tokio::fs::write(&media_path, &expected).await?;
     let torrent = create_torrent(
         seed_root.path(),
@@ -227,6 +299,7 @@ async fn downloads_prebuffers_and_serves_from_a_local_seed() -> Result<(), Box<d
     let engine = TorrentEngine::start(
         client_root.path().to_path_buf(),
         StreamCachePolicy::standard(),
+        TrackerListConfig::default(),
         MediaTools::unavailable_for_transfer_test(),
     )
     .await?;
@@ -281,4 +354,10 @@ async fn downloads_prebuffers_and_serves_from_a_local_seed() -> Result<(), Box<d
     engine.shutdown().await?;
     seed_session.cancellation_token().cancel();
     Ok(())
+}
+
+fn transfer_fixture_bytes() -> Result<Vec<u8>, std::num::TryFromIntError> {
+    (0..TEST_FILE_BYTES)
+        .map(|offset| u8::try_from(offset % 251))
+        .collect()
 }

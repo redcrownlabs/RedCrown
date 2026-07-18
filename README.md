@@ -16,6 +16,8 @@ expiring stream cache rather than permanent downloads.
 - source and quality selection with torrent size and filename details;
 - Rust-owned BitTorrent metadata resolution and prioritized streaming through
   `librqbit`;
+- bounded supplemental tracker import for trackerless magnets from a
+  configurable HTTPS URL or absolute local file;
 - loopback-only, tokenized HTTP range playback;
 - FFmpeg compatibility bridging with audio-track and subtitle selection;
 - favorites, watch progress, and Popcorn Time settings/library import;
@@ -75,6 +77,13 @@ compatible API base URLs in fallback order, select **Test all**, and then
 app opens Home. Configuration is stored in the operating system's per-user
 application-data directory, never in the repository checkout.
 
+Tracker import is enabled initially and points to the daily public
+`trackers_all.txt` list maintained by
+[ngosang/trackerslist](https://github.com/ngosang/trackerslist). Settings can
+disable it or select another HTTPS URL or absolute local file. RedCrown caps
+imports at 1 MiB and 512 unique trackers and supplements only magnets that have
+no tracker of their own.
+
 ## Pre-release builds
 
 Windows installer and ZIP builds are published on the
@@ -104,6 +113,12 @@ media fixture; it does not depend on a public swarm:
 ./scripts/test-media.ps1
 ```
 
+Qualify a specific public magnet outside Electron with:
+
+```powershell
+./scripts/test-magnet.ps1 -Magnet '<magnet URI>'
+```
+
 ## OpenTelemetry
 
 Trace export is disabled by default. To export the deliberately restricted
@@ -121,8 +136,9 @@ header values as secrets and never commit them.
 
 ## Responsible use
 
-RedCrown does not ship media, catalog services, tracker lists, or API
-credentials. Users and downstream distributors are responsible for configuring
+RedCrown does not ship media, catalog services, tracker-list contents, or API
+credentials. Its initial settings reference a third-party public tracker-list
+URL, which users can disable or replace. Users and downstream distributors are responsible for configuring
 lawful sources and complying with copyright law and the terms of services they
 use. The project is not affiliated with Popcorn Time, Netflix, TMDB, or any
 content provider.

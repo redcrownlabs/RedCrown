@@ -438,6 +438,8 @@
   .library-view { @apply mx-auto max-w-7xl; }
   .page-header { @apply mb-9 flex items-end justify-between gap-6; }
   .page-header p { @apply mt-3 text-muted; }
+  .settings-header-actions { @apply flex min-w-44 flex-col items-end gap-3; }
+  .settings-header-actions span { @apply min-h-4 text-right text-xs text-muted; }
   .compact-header { @apply mb-8 grid grid-cols-[minmax(0,1fr)_auto] items-end gap-8; }
   .library-stats { @apply flex flex-wrap justify-end gap-3; }
   .library-stats span { @apply min-w-28 rounded-xl border border-line bg-panel px-4 py-3.5 text-xs text-muted; }
@@ -468,8 +470,16 @@
   .health { @apply col-start-2 col-end-[-1] text-xs; }
   .health.good { @apply text-good; }
   .health.bad, .field-error { @apply text-danger; }
+  .field-help, .field-error { @apply mt-2 text-xs; }
+  .field-help { @apply text-muted; }
+  .tracker-source-kind { @apply mt-6 inline-flex rounded-xl border border-line bg-surface p-1; }
+  .tracker-source-kind button { @apply min-h-10 rounded-lg px-4 text-sm font-semibold text-muted transition-colors; }
+  .tracker-source-kind button.is-active { @apply bg-panel-soft text-copy shadow-sm; }
+  .tracker-source-field { @apply max-w-4xl; }
+  .tracker-source-field input[aria-invalid="true"] { @apply border-danger; }
   .settings-actions { @apply mt-8 flex items-center justify-end gap-3 border-t border-line pt-6; }
   .settings-actions > span { @apply mr-auto text-xs text-muted; }
+  .endpoint-test-actions { @apply justify-end; }
   .storage-grid { @apply grid grid-cols-3 gap-5; }
   .migration-section { @apply border-brand/35; background-image: linear-gradient(145deg, #1b1921, var(--color-panel) 54%); }
   .section-kicker { @apply mb-1.5 text-xs font-black tracking-widest text-brand-bright uppercase; }
@@ -530,6 +540,8 @@
   .feature-hero::before { background: linear-gradient(0deg in oklab, var(--color-surface) 0%, rgb(8 9 12 / 68%) 55%, rgb(8 9 12 / 28%)); }
   .hero-copy h1 { @apply max-w-full text-[clamp(2.35rem,13vw,4rem)]; }
   .catalog-header, .page-header, .settings-intro { @apply flex-col items-start; }
+  .settings-header-actions { @apply w-full items-stretch; }
+  .settings-header-actions span { @apply text-left; }
   .category-tabs { @apply w-full; }
   .category-tabs button { @apply flex-1; }
   .catalog-toolbar { @apply items-stretch; }

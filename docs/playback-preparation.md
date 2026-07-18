@@ -118,3 +118,10 @@ fetches the tokenized loopback HTTP stream, and compares every output byte with
 the source.
 
 Run it from the repository root with `./scripts/test-torrent.ps1`.
+
+For a real public swarm, use
+`./scripts/test-magnet.ps1 -Magnet '<magnet URI>'`. This ignored network
+qualification test imports the configured tracker list, resolves metadata,
+selects a supported media file, and verifies a 256 KiB loopback range outside
+Electron. The magnet is supplied only through the process environment and is
+not stored in the repository.

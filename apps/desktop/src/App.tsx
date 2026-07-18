@@ -46,6 +46,7 @@ import {
   moveEndpoint,
   normalizeEndpoint,
   validateSource,
+  validateTrackerList,
 } from "./settings-model";
 import { RedCrownPlayer } from "./RedCrownPlayer";
 
@@ -55,6 +56,9 @@ type HomeSection = {
   kind: MediaKind;
   items: MediaItem[];
 };
+
+const DEFAULT_TRACKER_LIST_URL =
+  "https://raw.githubusercontent.com/ngosang/trackerslist/refs/heads/master/trackers_all.txt";
 
 const HOME_CATALOG_REQUESTS: ReadonlyArray<{ title: string; query: CatalogQuery }> = [
   { title: "Trending movies", query: catalogQuery("movie", "trending") },
@@ -1370,8 +1374,11 @@ function SettingsView({
   const [draft, setDraft] = useState(() => structuredClone(initial));
   const [health, setHealth] = useState<Record<string, EndpointHealth>>({});
   const [status, setStatus] = useState<string>();
+  const [trackerTouched, setTrackerTouched] = useState(false);
   const source = draft.sources[0];
-  const validation = source ? validateSource(source) : "A source is required";
+  const sourceValidation = source ? validateSource(source) : "A source is required";
+  const trackerValidation = validateTrackerList(draft.tracker_list);
+  const validation = sourceValidation ?? trackerValidation;
 
   function updateSource(update: (source: SourceConfig) => SourceConfig) {
     setDraft((current) => ({
@@ -1381,7 +1388,7 @@ function SettingsView({
   }
 
   async function testSource() {
-    if (!source || validation) return;
+    if (!source || sourceValidation) return;
     setStatus("Testing fallback chain…");
     try {
       const result = await invoke<EndpointHealth[]>("source.test", { source });
@@ -1393,8 +1400,9 @@ function SettingsView({
   }
 
   async function save() {
+    setTrackerTouched(true);
     if (!source || validation) return;
-    setStatus("Saving…");
+    setStatus("Saving and importing trackers…");
     try {
       const normalized = {
         ...draft,
@@ -1405,6 +1413,12 @@ function SettingsView({
             url: normalizeEndpoint(endpoint.url),
           })),
         })),
+        tracker_list: {
+          ...draft.tracker_list,
+          source: draft.tracker_list.source.kind === "url"
+            ? { kind: "url" as const, url: new URL(draft.tracker_list.source.url.trim()).toString() }
+            : { kind: "file" as const, path: draft.tracker_list.source.path.trim() },
+        },
       };
       const saved = await invoke<AppSettings>("settings.save", { settings: normalized });
       setDraft(saved);
@@ -1419,6 +1433,10 @@ function SettingsView({
     <div className="settings-view">
       <header className="page-header">
         <div><p className="eyebrow">RedCrown</p><h1>Settings</h1><p>Sources, migration, and temporary storage.</p></div>
+        <div className="settings-header-actions">
+          <span aria-live="polite">{status}</span>
+          <button className="primary-button" disabled={Boolean(validation)} onClick={() => void save()}>Save settings</button>
+        </div>
       </header>
       {configurationRequired && (
         <section className="setup-notice" aria-labelledby="setup-title">
@@ -1465,12 +1483,102 @@ function SettingsView({
           ))}
         </div>
         <button className="secondary-button" onClick={() => updateSource((entry) => ({ ...entry, endpoints: [...entry.endpoints, { id: crypto.randomUUID(), url: "https://", enabled: true }] }))}>Add fallback URL</button>
-        {validation && <p className="field-error">{validation}</p>}
-        <div className="settings-actions">
-          <span aria-live="polite">{status}</span>
-          <button className="secondary-button" disabled={Boolean(validation)} onClick={() => void testSource()}>Test all</button>
-          <button className="primary-button" disabled={Boolean(validation)} onClick={() => void save()}>Save</button>
+        {sourceValidation && <p className="field-error">{sourceValidation}</p>}
+        <div className="settings-actions endpoint-test-actions">
+          <button className="secondary-button" disabled={Boolean(sourceValidation)} onClick={() => void testSource()}>Test all</button>
         </div>
+      </section>
+      <section className="settings-section" aria-labelledby="tracker-list-heading">
+        <div className="settings-intro">
+          <div>
+            <h2 id="tracker-list-heading">Supplemental tracker list</h2>
+            <p>Used only when a magnet contains no trackers. The list refreshes daily and keeps a last-known-good copy.</p>
+          </div>
+          <label className="switch">
+            <input
+              type="checkbox"
+              checked={draft.tracker_list.enabled}
+              onChange={(event) => setDraft((current) => ({
+                ...current,
+                tracker_list: { ...current.tracker_list, enabled: event.target.checked },
+              }))}
+            />
+            <span>Import enabled</span>
+          </label>
+        </div>
+        <div className="tracker-source-kind" role="group" aria-label="Tracker-list source type">
+          <button
+            type="button"
+            aria-pressed={draft.tracker_list.source.kind === "url"}
+            className={draft.tracker_list.source.kind === "url" ? "is-active" : undefined}
+            onClick={() => setDraft((current) => ({
+              ...current,
+              tracker_list: {
+                ...current.tracker_list,
+                source: { kind: "url", url: DEFAULT_TRACKER_LIST_URL },
+              },
+            }))}
+          >
+            HTTPS URL
+          </button>
+          <button
+            type="button"
+            aria-pressed={draft.tracker_list.source.kind === "file"}
+            className={draft.tracker_list.source.kind === "file" ? "is-active" : undefined}
+            onClick={() => setDraft((current) => ({
+              ...current,
+              tracker_list: {
+                ...current.tracker_list,
+                source: { kind: "file", path: "" },
+              },
+            }))}
+          >
+            Local file
+          </button>
+        </div>
+        {draft.tracker_list.source.kind === "url" ? (
+          <label className="field tracker-source-field">
+            <span>Tracker-list URL</span>
+            <input
+              type="url"
+              name="tracker-list-url"
+              value={draft.tracker_list.source.url}
+              aria-describedby="tracker-list-help tracker-list-error"
+              aria-invalid={trackerTouched && Boolean(trackerValidation)}
+              onBlur={() => setTrackerTouched(true)}
+              onChange={(event) => setDraft((current) => ({
+                ...current,
+                tracker_list: {
+                  ...current.tracker_list,
+                  source: { kind: "url", url: event.target.value },
+                },
+              }))}
+            />
+          </label>
+        ) : (
+          <label className="field tracker-source-field">
+            <span>Absolute tracker-list path</span>
+            <input
+              name="tracker-list-path"
+              value={draft.tracker_list.source.path}
+              placeholder="C:\\trackers\\trackers.txt"
+              aria-describedby="tracker-list-help tracker-list-error"
+              aria-invalid={trackerTouched && Boolean(trackerValidation)}
+              onBlur={() => setTrackerTouched(true)}
+              onChange={(event) => setDraft((current) => ({
+                ...current,
+                tracker_list: {
+                  ...current.tracker_list,
+                  source: { kind: "file", path: event.target.value },
+                },
+              }))}
+            />
+          </label>
+        )}
+        <p id="tracker-list-help" className="field-help">Whitespace-separated HTTP, HTTPS, and UDP tracker URLs; maximum 1 MiB and 512 trackers.</p>
+        <p id="tracker-list-error" className="field-error" aria-live="polite">
+          {trackerTouched ? trackerValidation : undefined}
+        </p>
       </section>
       <section className="settings-section">
         <div className="settings-intro"><div><h2>Temporary stream cache</h2><p>Reusable only for a short period. Active playback is never evicted.</p></div></div>

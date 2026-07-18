@@ -244,6 +244,7 @@ async fn run_application() -> anyhow::Result<()> {
             TorrentEngine::start(
                 directories.cache_dir().join("streams"),
                 initial_settings.stream_cache,
+                initial_settings.tracker_list.clone(),
                 media_tools,
             )
             .await
@@ -399,8 +400,21 @@ async fn dispatch_method(
         .map_err(|error| BackendError::serialization(&error)),
         "settings.save" => {
             let params: SaveSettingsParams = decode_params(params)?;
+            let prepared_trackers = if let Some(torrent) = &state.torrent {
+                Some(
+                    torrent
+                        .prepare_tracker_list(params.settings.tracker_list.clone())
+                        .await
+                        .map_err(|error| BackendError::new(error.user_message()))?,
+                )
+            } else {
+                None
+            };
             let saved = state.settings.save(params.settings).await?;
             if let Some(torrent) = &state.torrent {
+                if let Some(prepared) = prepared_trackers {
+                    torrent.activate_tracker_list(prepared).await;
+                }
                 torrent
                     .update_cache_policy(saved.stream_cache)
                     .await

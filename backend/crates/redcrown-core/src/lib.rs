@@ -3,6 +3,7 @@
 
 use std::backtrace::Backtrace;
 use std::fmt::{Display, Formatter};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,8 @@ const MIN_CACHE_DURATION_SECS: u64 = 60;
 const MAX_CACHE_DURATION_SECS: u64 = 7 * 24 * 60 * 60;
 const MIN_CACHE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CACHE_SIZE_BYTES: u64 = 500 * 1024 * 1024 * 1024;
+const DEFAULT_TRACKER_LIST_URL: &str =
+    "https://raw.githubusercontent.com/ngosang/trackerslist/refs/heads/master/trackers_all.txt";
 
 /// Identifies one logical catalog source.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -214,6 +217,94 @@ impl Default for StreamCachePolicy {
     }
 }
 
+/// Selects where `RedCrown` imports supplemental public trackers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TrackerListSource {
+    /// Download the list over HTTP.
+    Url {
+        /// Remote tracker-list URL.
+        url: Url,
+    },
+    /// Read the list from an absolute local path.
+    File {
+        /// Local tracker-list file.
+        path: PathBuf,
+    },
+}
+
+impl TrackerListSource {
+    /// Validates the configured tracker-list location.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for insecure URLs, credentials, or relative file paths.
+    pub fn validate(&self) -> Result<(), ConfigurationError> {
+        match self {
+            Self::Url { url } => {
+                if url.scheme() != "https" {
+                    return Err(ConfigurationError::new("tracker-list URL must use HTTPS"));
+                }
+                if !url.username().is_empty() || url.password().is_some() {
+                    return Err(ConfigurationError::new(
+                        "tracker-list URL must not contain credentials",
+                    ));
+                }
+                if url.host_str().is_none() {
+                    return Err(ConfigurationError::new(
+                        "tracker-list URL must include a host",
+                    ));
+                }
+            }
+            Self::File { path } if !path.is_absolute() => {
+                return Err(ConfigurationError::new(
+                    "tracker-list file path must be absolute",
+                ));
+            }
+            Self::File { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+impl Default for TrackerListSource {
+    fn default() -> Self {
+        Self::Url {
+            url: Url::parse(DEFAULT_TRACKER_LIST_URL)
+                .expect("the built-in tracker-list URL must remain valid"),
+        }
+    }
+}
+
+/// Configures supplemental tracker discovery for trackerless magnets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackerListConfig {
+    /// Whether imported trackers participate in metadata discovery.
+    pub enabled: bool,
+    /// Remote or local tracker-list location.
+    pub source: TrackerListSource,
+}
+
+impl TrackerListConfig {
+    /// Validates the tracker-list configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected source is invalid.
+    pub fn validate(&self) -> Result<(), ConfigurationError> {
+        self.source.validate()
+    }
+}
+
+impl Default for TrackerListConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            source: TrackerListSource::default(),
+        }
+    }
+}
+
 /// Stores user-editable application settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -223,6 +314,9 @@ pub struct AppSettings {
     pub sources: Vec<SourceConfig>,
     /// Temporary stream-cache policy.
     pub stream_cache: StreamCachePolicy,
+    /// Supplemental public tracker-list import.
+    #[serde(default)]
+    pub tracker_list: TrackerListConfig,
     /// Preferred interface theme.
     pub theme: ThemePreference,
 }
@@ -240,6 +334,7 @@ impl AppSettings {
                 endpoints: Vec::new(),
             }],
             stream_cache: StreamCachePolicy::standard(),
+            tracker_list: TrackerListConfig::default(),
             theme: ThemePreference::System,
         }
     }
@@ -251,6 +346,7 @@ impl AppSettings {
     /// Returns the first invalid source or cache-policy error.
     pub fn validate(&self) -> Result<(), ConfigurationError> {
         self.stream_cache.validate()?;
+        self.tracker_list.validate()?;
         for source in &self.sources {
             if source.enabled && source.endpoints.is_empty() {
                 continue;
@@ -527,7 +623,9 @@ impl std::error::Error for ConfigurationError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{SourceEndpoint, StreamCachePolicy};
+    use std::path::PathBuf;
+
+    use super::{AppSettings, SourceEndpoint, StreamCachePolicy, TrackerListSource};
 
     #[test]
     fn endpoint_rejects_credentials() {
@@ -543,5 +641,36 @@ mod tests {
             size_budget_bytes: 1024 * 1024 * 1024,
         };
         assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn tracker_list_requires_https_or_an_absolute_file() {
+        let insecure = TrackerListSource::Url {
+            url: url::Url::parse("http://example.com/trackers.txt").expect("test URL"),
+        };
+        let relative = TrackerListSource::File {
+            path: PathBuf::from("trackers.txt"),
+        };
+
+        assert!(insecure.validate().is_err());
+        assert!(relative.validate().is_err());
+    }
+
+    #[test]
+    fn older_settings_receive_the_default_tracker_list() {
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "sources": [],
+            "stream_cache": {
+                "idle_expiration_secs": 21_600,
+                "maximum_age_secs": 86_400,
+                "size_budget_bytes": 21_474_836_480_u64
+            },
+            "theme": "system"
+        });
+        let settings: AppSettings = serde_json::from_value(value).expect("legacy settings");
+
+        assert!(settings.tracker_list.enabled);
+        assert!(settings.tracker_list.validate().is_ok());
     }
 }

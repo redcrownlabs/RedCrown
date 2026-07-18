@@ -30,12 +30,17 @@ Rutracker rejects anonymous requests with 403. RedCrown backports upstream 9.0's
 behavior and sends librqbit's truthful name and version on its shared HTTP
 client.
 
+Version 8.1.1 applies `AddTorrentOptions::trackers` to torrent-file inputs but
+silently ignores the same option during magnet metadata discovery. RedCrown
+merges those application-supplied trackers into magnet discovery and locks the
+option contract in a focused `src/session.rs` regression test.
+
 ## Maintenance invariant
 
 Keep this fork aligned with upstream 8.1.1 except for documented changes.
-Remove the patch after a stable, qualified librqbit release supplies a nonzero
-tracker port during metadata resolution. Do not add RedCrown application logic
-to this crate.
+Remove the patches after a stable, qualified librqbit release supplies a
+nonzero tracker port during metadata resolution and honors custom trackers for
+magnets. Do not add RedCrown application logic to this crate.
 
 ## Tradeoff
 

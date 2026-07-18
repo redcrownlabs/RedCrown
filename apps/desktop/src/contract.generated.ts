@@ -30,10 +30,20 @@ export interface StreamCachePolicy {
   size_budget_bytes: number;
 }
 
+export type TrackerListSource =
+  | { kind: "url"; url: string }
+  | { kind: "file"; path: string };
+
+export interface TrackerListConfig {
+  enabled: boolean;
+  source: TrackerListSource;
+}
+
 export interface AppSettings {
   schema_version: number;
   sources: SourceConfig[];
   stream_cache: StreamCachePolicy;
+  tracker_list: TrackerListConfig;
   theme: ThemePreference;
 }
 

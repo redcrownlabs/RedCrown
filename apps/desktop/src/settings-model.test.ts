@@ -5,6 +5,7 @@ import {
   moveEndpoint,
   normalizeEndpoint,
   validateSource,
+  validateTrackerList,
 } from "./settings-model";
 
 describe("source settings", () => {
@@ -41,6 +42,13 @@ describe("source settings", () => {
         maximum_age_secs: 7200,
         size_budget_bytes: 1073741824,
       },
+      tracker_list: {
+        enabled: true,
+        source: {
+          kind: "url" as const,
+          url: "https://example.com/trackers.txt",
+        },
+      },
       theme: "system" as const,
     };
 
@@ -52,5 +60,27 @@ describe("source settings", () => {
         endpoints: [{ id: "endpoint", url: "https://example.com/", enabled: true }],
       }],
     })).toBe(true);
+  });
+
+  it("accepts HTTPS tracker lists and absolute Windows paths", () => {
+    expect(validateTrackerList({
+      enabled: true,
+      source: { kind: "url", url: "https://example.com/trackers.txt" },
+    })).toBeUndefined();
+    expect(validateTrackerList({
+      enabled: true,
+      source: { kind: "file", path: "C:\\trackers\\public.txt" },
+    })).toBeUndefined();
+  });
+
+  it("rejects insecure tracker-list URLs and relative paths", () => {
+    expect(validateTrackerList({
+      enabled: true,
+      source: { kind: "url", url: "http://example.com/trackers.txt" },
+    })).toContain("HTTPS");
+    expect(validateTrackerList({
+      enabled: true,
+      source: { kind: "file", path: "trackers.txt" },
+    })).toContain("absolute");
   });
 });

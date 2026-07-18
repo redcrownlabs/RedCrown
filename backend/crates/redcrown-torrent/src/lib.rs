@@ -25,7 +25,7 @@ use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ListOnlyResponse, Session,
     SessionOptions,
 };
-use redcrown_core::StreamCachePolicy;
+use redcrown_core::{StreamCachePolicy, TrackerListConfig};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::net::TcpListener;
@@ -37,8 +37,12 @@ use tracing::{Level, event};
 use uuid::Uuid;
 
 mod cache;
+mod tracker_list;
 
 use cache::{CacheKey, StreamCache};
+#[doc(inline)]
+pub use tracker_list::PreparedTrackerList;
+use tracker_list::TrackerList;
 
 const STREAM_READ_BUFFER_BYTES: usize = 64 * 1024;
 /// DHT routing state is separate from expiring media-cache entries.
@@ -55,6 +59,8 @@ const MAX_START_BUFFER_BYTES: u64 = 32 * 1024 * 1024;
 const START_BUFFER_DIVISOR: u64 = 100;
 /// Five-minute maintenance bounds expiration delay and manifest write frequency.
 const CACHE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// The default public list updates daily, so more frequent polling adds little value.
+const TRACKER_LIST_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Media inspection must fail instead of hanging playback indefinitely.
 const MEDIA_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// `FFmpeg` stderr is bounded before it enters structured diagnostics.
@@ -287,7 +293,9 @@ pub struct TorrentEngine {
     stream_token: String,
     stream_task: JoinHandle<()>,
     cleanup_task: JoinHandle<()>,
+    tracker_refresh_task: JoinHandle<()>,
     cache: Arc<StreamCache>,
+    tracker_list: Arc<TrackerList>,
     ffprobe: PathBuf,
     media_manifests: Arc<RwLock<HashMap<(usize, usize), MediaManifest>>>,
     active_torrents: Mutex<HashMap<usize, CacheKey>>,
@@ -301,6 +309,7 @@ impl std::fmt::Debug for TorrentEngine {
             .field("stream_address", &self.stream_address)
             .field("stream_task", &self.stream_task)
             .field("cleanup_task", &self.cleanup_task)
+            .field("tracker_refresh_task", &self.tracker_refresh_task)
             .finish_non_exhaustive()
     }
 }
@@ -314,6 +323,7 @@ impl TorrentEngine {
     pub async fn start(
         cache_root: PathBuf,
         cache_policy: StreamCachePolicy,
+        tracker_list_config: TrackerListConfig,
         media_tools: MediaTools,
     ) -> Result<Self, TorrentError> {
         let cache = Arc::new(
@@ -321,6 +331,7 @@ impl TorrentEngine {
                 .await
                 .map_err(|error| TorrentError::new(error.user_message()))?,
         );
+        let tracker_list = TrackerList::open(cache_root.clone(), tracker_list_config).await?;
         let options = session_options(&cache_root);
         let session = Session::new_with_opts(cache_root, options)
             .await
@@ -378,13 +389,30 @@ impl TorrentEngine {
                 }
             }
         });
+        let refresh_tracker_list = Arc::clone(&tracker_list);
+        let tracker_refresh_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(TRACKER_LIST_REFRESH_INTERVAL);
+            loop {
+                interval.tick().await;
+                if let Err(error) = refresh_tracker_list.refresh().await {
+                    event!(
+                        name: "torrent.tracker_list.refresh.failed",
+                        Level::WARN,
+                        error.message = error.user_message(),
+                        "scheduled tracker-list refresh failed; retaining the prior list"
+                    );
+                }
+            }
+        });
         Ok(Self {
             api,
             stream_address,
             stream_token,
             stream_task,
             cleanup_task,
+            tracker_refresh_task,
             cache,
+            tracker_list,
             ffprobe: media_tools.ffprobe,
             media_manifests,
             active_torrents: Mutex::new(HashMap::new()),
@@ -519,13 +547,14 @@ impl TorrentEngine {
         &self,
         preparation_id: Uuid,
     ) -> Result<TorrentDiagnostics, TorrentError> {
-        let magnet_link = self
+        let source = self
             .preparation
             .lock()
             .await
             .as_ref()
             .filter(|preparation| preparation.id == preparation_id)
-            .and_then(|preparation| magnet_link(&preparation.source));
+            .map(|preparation| preparation.source.clone());
+        let magnet_link = source.as_deref().and_then(magnet_link);
         let playback = self.playback_status(preparation_id).await?;
         let dht = self.api.api_dht_stats().ok().map(|stats| DhtDiagnostics {
             node_id: stats.id.as_string(),
@@ -533,12 +562,16 @@ impl TorrentEngine {
             routing_table_size: stats.routing_table_size,
         });
         let Some(ticket) = playback.ticket.as_ref() else {
+            let trackers = match source {
+                Some(source) => self.tracker_list.trackers_for(&source).await.to_vec(),
+                None => Vec::new(),
+            };
             return Ok(TorrentDiagnostics {
                 playback,
                 engine_state: None,
                 info_hash: None,
                 magnet_link,
-                trackers: Vec::new(),
+                trackers,
                 uploaded_bytes: 0,
                 upload_mib_per_second: 0.0,
                 peers: PeerDiagnostics::default(),
@@ -645,6 +678,25 @@ impl TorrentEngine {
             .update_policy(policy)
             .await
             .map_err(|error| TorrentError::new(error.user_message()))
+    }
+
+    /// Imports a tracker-list configuration without activating it.
+    ///
+    /// This lets the settings store commit first and activate without fallible I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source is unavailable or has no valid trackers.
+    pub async fn prepare_tracker_list(
+        &self,
+        config: TrackerListConfig,
+    ) -> Result<PreparedTrackerList, TorrentError> {
+        self.tracker_list.prepare_config(config).await
+    }
+
+    /// Activates a successfully imported tracker-list configuration.
+    pub async fn activate_tracker_list(&self, prepared: PreparedTrackerList) -> usize {
+        self.tracker_list.activate(prepared).await
     }
 
     /// Resolves metadata and starts streaming the requested media file.
@@ -846,6 +898,8 @@ impl TorrentEngine {
     }
 
     async fn resolve_metadata(&self, source: &str) -> Result<ListOnlyResponse, TorrentError> {
+        let supplemental = self.tracker_list.trackers_for(source).await;
+        let trackers = (!supplemental.is_empty()).then(|| supplemental.iter().cloned().collect());
         let response = self
             .api
             .session()
@@ -853,6 +907,7 @@ impl TorrentEngine {
                 AddTorrent::from_url(source),
                 Some(AddTorrentOptions {
                     list_only: true,
+                    trackers,
                     ..AddTorrentOptions::default()
                 }),
             )
@@ -1000,6 +1055,9 @@ fn session_options(cache_root: &FsPath) -> SessionOptions {
 
 impl Drop for TorrentEngine {
     fn drop(&mut self) {
+        self.stream_task.abort();
+        self.cleanup_task.abort();
+        self.tracker_refresh_task.abort();
         if let Some(preparation) = self.preparation.get_mut().take()
             && let Some(task) = preparation
                 .task
