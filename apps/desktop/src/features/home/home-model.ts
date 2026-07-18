@@ -1,4 +1,4 @@
-import type { LibraryItem, MediaItem } from "./contract.generated";
+import type { LibraryItem, MediaItem } from "../../shared/contract.generated";
 
 /** Removes watched movies while preserving every non-movie catalog item. */
 export function visibleHomeItems(items: MediaItem[], watchedMovies: LibraryItem[]) {

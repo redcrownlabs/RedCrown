@@ -3,7 +3,7 @@ import type {
   SourceConfig,
   SourceEndpoint,
   TrackerListConfig,
-} from "./contract.generated";
+} from "../../shared/contract.generated";
 
 export function hasConfiguredCatalog(settings: AppSettings): boolean {
   return settings.sources.some(

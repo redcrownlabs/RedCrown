@@ -1,4 +1,4 @@
-import type { PlaybackStage } from "./contract.generated";
+import type { PlaybackStage } from "../../shared/contract.generated";
 
 export function playbackPercent(downloadedBytes: number, totalBytes: number) {
   if (!Number.isFinite(downloadedBytes) || !Number.isFinite(totalBytes) || totalBytes <= 0) {
