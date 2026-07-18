@@ -1,4 +1,4 @@
-import type { AppSettings, SourceConfig, SourceEndpoint } from "./contract.generated";
+import type { AppSettings, SourceConfig, SourceEndpoint } from "../../shared/contract.generated";
 
 export function hasConfiguredCatalog(settings: AppSettings): boolean {
   return settings.sources.some(

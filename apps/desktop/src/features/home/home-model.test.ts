@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { LibraryItem, MediaItem } from "./contract.generated";
+import type { LibraryItem, MediaItem } from "../../shared/contract.generated";
 import { visibleHomeItems } from "./home-model";
 
 const media = (id: string, kind: MediaItem["kind"]): MediaItem => ({

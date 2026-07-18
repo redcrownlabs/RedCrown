@@ -123,3 +123,6 @@ The Electron shell costs more memory than a native Rust UI. It is accepted
 because the requested Loom-style process model is already understood, React
 supports the intended product experience, and all sensitive/high-throughput
 work remains in Rust.
+
+The renderer's internal feature and dependency boundaries are documented in
+[`renderer-architecture.md`](renderer-architecture.md).

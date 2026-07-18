@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, MouseEvent } from "react";
 
-import type { MediaItem, MediaTrack, PlaybackStatus } from "./contract.generated";
+import type { MediaItem, MediaTrack, PlaybackStatus } from "../../shared/contract.generated";
 import { formatBytes, formatDownloadSpeed } from "./playback-model";
 import {
   clampedSeekTime,

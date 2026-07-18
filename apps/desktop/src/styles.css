@@ -348,7 +348,7 @@
     backdrop-filter: blur(18px);
   }
   .playback-dismiss {
-    @apply absolute top-5 left-[clamp(1.25rem,3vw,2.5rem)] z-10 inline-flex min-h-11 items-center gap-2 rounded-xl border border-white/12 bg-black/35 px-4 text-sm font-semibold text-gray-200 backdrop-blur-md transition hover:bg-black/55 hover:text-copy;
+    @apply absolute top-5 left-[clamp(1.25rem,3vw,2.5rem)] z-10 inline-flex min-h-10 items-center gap-2 rounded-lg border-0 bg-transparent px-2 text-sm font-semibold text-gray-300 transition hover:bg-white/8 hover:text-copy;
   }
   .playback-dismiss svg { @apply size-4; }
   .playback-focus {
