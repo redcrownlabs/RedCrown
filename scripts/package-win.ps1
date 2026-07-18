@@ -80,6 +80,19 @@ if ((Get-ChildItem -LiteralPath $ffmpegTarget -Filter '*.dll' -File | Measure-Ob
     throw 'The staged shared FFmpeg runtime does not contain its required DLLs.'
 }
 
+# A release directory is a single-build snapshot. Keeping artifacts from older
+# versions makes the exact-artifact assertion ambiguous and can produce stale
+# checksums. Recreate it only after proving the resolved target remains inside
+# the desktop project; electron-builder will populate it from scratch.
+$resolvedReleaseOutput = [System.IO.Path]::GetFullPath($releaseOutput)
+$allowedDesktopOutput = [System.IO.Path]::GetFullPath($desktop) + [System.IO.Path]::DirectorySeparatorChar
+if (-not $resolvedReleaseOutput.StartsWith($allowedDesktopOutput, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw 'Release output cleanup escaped the desktop project directory.'
+}
+if (Test-Path -LiteralPath $resolvedReleaseOutput) {
+    Remove-Item -LiteralPath $resolvedReleaseOutput -Recurse -Force
+}
+
 $previousCodeSignDiscovery = $env:CSC_IDENTITY_AUTO_DISCOVERY
 $previousPath = $env:PATH
 $env:CSC_IDENTITY_AUTO_DISCOVERY = 'false'

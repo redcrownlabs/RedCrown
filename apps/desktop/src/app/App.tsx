@@ -140,13 +140,14 @@ export function App() {
   }
 
   async function closePlayer() {
-    if (playback) {
-      await invoke("playback.cancel", {
-        preparation_id: playback.preparation_id,
-      }).catch(() => undefined);
-    }
+    const activePlayback = playback;
     setPlayback(undefined);
     navigate("details");
+    if (activePlayback) {
+      await invoke("playback.cancel", {
+        preparation_id: activePlayback.preparation_id,
+      }).catch(() => undefined);
+    }
   }
 
   if (!bootstrap) {

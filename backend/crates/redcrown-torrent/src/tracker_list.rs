@@ -2,13 +2,13 @@
 // Rust guideline compliant 2026-02-21
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use redcrown_core::{TrackerListConfig, TrackerListSource};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{Level, event};
 use url::Url;
@@ -19,13 +19,20 @@ use super::TorrentError;
 const MAX_TRACKER_LIST_BYTES: usize = 1024 * 1024;
 /// A malformed or hostile list cannot create an unbounded announce fan-out.
 const MAX_TRACKERS: usize = 512;
-const CACHE_SCHEMA_VERSION: u32 = 1;
-const CACHE_FILENAME: &str = ".redcrown-trackers.json";
+// Tracker-list refreshes must preserve the last valid cache even when Windows
+// refuses to rename over an existing file or a write is interrupted. Alternating
+// generation-numbered slots provides that invariant without a platform-specific
+// replacement primitive. The accepted tradeoff is one additional small cache
+// file and selecting the newest valid generation during startup.
+const CACHE_SCHEMA_VERSION: u32 = 2;
+const CACHE_SLOT_A: &str = ".redcrown-trackers.a.json";
+const CACHE_SLOT_B: &str = ".redcrown-trackers.b.json";
 
 #[derive(Debug, Clone)]
 struct TrackerListState {
     config: TrackerListConfig,
     trackers: Arc<[String]>,
+    cache_generation: u64,
 }
 
 /// Holds a validated tracker-list update ready for an atomic settings commit.
@@ -38,6 +45,7 @@ pub struct PreparedTrackerList {
 #[derive(Debug, Serialize, Deserialize)]
 struct TrackerListCache {
     schema_version: u32,
+    generation: u64,
     source: TrackerListSource,
     trackers: Vec<String>,
 }
@@ -46,7 +54,7 @@ struct TrackerListCache {
 #[derive(Debug)]
 pub(super) struct TrackerList {
     client: reqwest::Client,
-    cache_path: PathBuf,
+    cache_root: PathBuf,
     state: RwLock<TrackerListState>,
     refresh_lock: Mutex<()>,
 }
@@ -70,15 +78,15 @@ impl TrackerList {
             .map_err(|error| {
                 TorrentError::new(format!("failed to create tracker-list client: {error}"))
             })?;
-        let cache_path = cache_root.join(CACHE_FILENAME);
-        let cached = load_matching_cache(&cache_path, &config).await;
-        let has_cached_trackers = !cached.is_empty();
+        let cached = load_matching_cache(&cache_root, &config).await;
+        let has_cached_trackers = !cached.trackers.is_empty();
         let tracker_list = Arc::new(Self {
             client,
-            cache_path,
+            cache_root,
             state: RwLock::new(TrackerListState {
                 config,
-                trackers: cached.into(),
+                trackers: cached.trackers.into(),
+                cache_generation: cached.generation,
             }),
             refresh_lock: Mutex::new(()),
         });
@@ -136,14 +144,25 @@ impl TrackerList {
 
     /// Activates a previously imported configuration without further I/O.
     pub(super) async fn activate(&self, prepared: PreparedTrackerList) -> usize {
+        let _guard = self.refresh_lock.lock().await;
         let PreparedTrackerList { config, trackers } = prepared;
-        if config.enabled {
-            persist_cache(&self.cache_path, &config.source, &trackers).await;
-        }
+        let current_generation = self.state.read().await.cache_generation;
+        let cache_generation = if config.enabled {
+            persist_cache(
+                &self.cache_root,
+                &config.source,
+                &trackers,
+                current_generation,
+            )
+            .await
+        } else {
+            current_generation
+        };
         let count = trackers.len();
         *self.state.write().await = TrackerListState {
             config,
             trackers: trackers.into(),
+            cache_generation,
         };
         count
     }
@@ -160,11 +179,19 @@ impl TrackerList {
             return Ok(0);
         }
         let trackers = self.read_source(&config.source).await?;
-        persist_cache(&self.cache_path, &config.source, &trackers).await;
+        let current_generation = self.state.read().await.cache_generation;
+        let cache_generation = persist_cache(
+            &self.cache_root,
+            &config.source,
+            &trackers,
+            current_generation,
+        )
+        .await;
         let count = trackers.len();
         *self.state.write().await = TrackerListState {
             config,
             trackers: trackers.into(),
+            cache_generation,
         };
         event!(
             name: "torrent.tracker_list.refresh.succeeded",
@@ -281,43 +308,62 @@ fn requires_supplemental_trackers(source: &str) -> bool {
             .any(|(key, value)| key == "tr" && !value.is_empty())
 }
 
-async fn load_matching_cache(path: &PathBuf, config: &TrackerListConfig) -> Vec<String> {
-    if !config.enabled {
-        return Vec::new();
-    }
-    let Ok(bytes) = fs::read(path).await else {
-        return Vec::new();
-    };
-    let Ok(cache) = serde_json::from_slice::<TrackerListCache>(&bytes) else {
-        return Vec::new();
-    };
-    if cache.schema_version != CACHE_SCHEMA_VERSION || cache.source != config.source {
-        return Vec::new();
-    }
-    parse_tracker_list(cache.trackers.join("\n").as_bytes()).unwrap_or_default()
+#[derive(Debug, Default)]
+struct CacheSnapshot {
+    generation: u64,
+    trackers: Vec<String>,
 }
 
-async fn persist_cache(path: &PathBuf, source: &TrackerListSource, trackers: &[String]) {
+async fn load_matching_cache(root: &Path, config: &TrackerListConfig) -> CacheSnapshot {
+    if !config.enabled {
+        return CacheSnapshot::default();
+    }
+    let mut snapshots = Vec::with_capacity(2);
+    for slot in [root.join(CACHE_SLOT_A), root.join(CACHE_SLOT_B)] {
+        let Ok(bytes) = fs::read(slot).await else {
+            continue;
+        };
+        let Ok(cache) = serde_json::from_slice::<TrackerListCache>(&bytes) else {
+            continue;
+        };
+        if cache.schema_version != CACHE_SCHEMA_VERSION || cache.source != config.source {
+            continue;
+        }
+        let Ok(trackers) = parse_tracker_list(cache.trackers.join("\n").as_bytes()) else {
+            continue;
+        };
+        snapshots.push(CacheSnapshot {
+            generation: cache.generation,
+            trackers,
+        });
+    }
+    snapshots
+        .into_iter()
+        .max_by_key(|snapshot| snapshot.generation)
+        .unwrap_or_default()
+}
+
+async fn persist_cache(
+    root: &Path,
+    source: &TrackerListSource,
+    trackers: &[String],
+    current_generation: u64,
+) -> u64 {
+    let Some(generation) = current_generation.checked_add(1) else {
+        event!(
+            name: "torrent.tracker_list.cache.failed",
+            Level::WARN,
+            "tracker-list cache generation exhausted"
+        );
+        return current_generation;
+    };
     let cache = TrackerListCache {
         schema_version: CACHE_SCHEMA_VERSION,
+        generation,
         source: source.clone(),
         trackers: trackers.to_vec(),
     };
-    let result = match serde_json::to_vec(&cache) {
-        Ok(bytes) => {
-            let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
-            let result = async {
-                fs::write(&temporary, bytes).await?;
-                fs::rename(&temporary, path).await
-            }
-            .await;
-            if result.is_err() {
-                let _ = fs::remove_file(&temporary).await;
-            }
-            result
-        }
-        Err(error) => Err(std::io::Error::other(error)),
-    };
+    let result = write_cache_slot(root, &cache).await;
     if let Err(error) = result {
         event!(
             name: "torrent.tracker_list.cache.failed",
@@ -325,12 +371,55 @@ async fn persist_cache(path: &PathBuf, source: &TrackerListSource, trackers: &[S
             error.message = %error,
             "tracker-list cache write failed"
         );
+        return current_generation;
     }
+    generation
+}
+
+async fn write_cache_slot(root: &Path, cache: &TrackerListCache) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(cache).map_err(std::io::Error::other)?;
+    let slot = root.join(if cache.generation.is_multiple_of(2) {
+        CACHE_SLOT_A
+    } else {
+        CACHE_SLOT_B
+    });
+    let temporary = root.join(format!(
+        ".redcrown-trackers-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = async {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .await?;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        if let Err(error) = fs::remove_file(&slot).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error);
+        }
+        fs::rename(&temporary, slot).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary).await;
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_tracker_list, requires_supplemental_trackers};
+    use redcrown_core::{TrackerListConfig, TrackerListSource};
+    use tempfile::tempdir;
+    use url::Url;
+
+    use super::{
+        load_matching_cache, parse_tracker_list, persist_cache, requires_supplemental_trackers,
+    };
 
     #[test]
     fn parses_whitespace_lists_and_removes_duplicates() {
@@ -355,5 +444,27 @@ mod tests {
         assert!(!requires_supplemental_trackers(
             "https://example.test/file.torrent"
         ));
+    }
+
+    #[tokio::test]
+    async fn replaces_cache_reliably_across_multiple_generations() {
+        let root = tempdir().expect("cache root");
+        let source = TrackerListSource::Url {
+            url: Url::parse("https://example.test/trackers.txt").expect("source URL"),
+        };
+        let config = TrackerListConfig {
+            enabled: true,
+            source: source.clone(),
+        };
+        let first = vec!["udp://first.example:80/announce".to_owned()];
+        let second = vec!["udp://second.example:80/announce".to_owned()];
+
+        let generation = persist_cache(root.path(), &source, &first, 0).await;
+        let generation = persist_cache(root.path(), &source, &second, generation).await;
+        let loaded = load_matching_cache(root.path(), &config).await;
+
+        assert_eq!(generation, 2);
+        assert_eq!(loaded.generation, 2);
+        assert_eq!(loaded.trackers, second);
     }
 }

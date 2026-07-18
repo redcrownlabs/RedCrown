@@ -293,7 +293,8 @@
     @apply grid size-11 shrink-0 place-items-center rounded-full border-0 bg-transparent p-0 text-white transition hover:bg-white/14 focus-visible:bg-white/14;
   }
   .player-icon-button svg { @apply size-6; }
-  .player-back { @apply min-h-11 shrink-0 bg-black/28 px-3 -ml-3 text-white backdrop-blur-md; }
+  .player-back { @apply min-h-11 shrink-0 bg-black/28 px-4 -ml-3 text-white backdrop-blur-md; }
+  .player-back > * { @apply pointer-events-none; }
   .player-back svg { @apply size-5; }
   .player-title { @apply min-w-0 flex-1 pt-0.5 text-shadow-lg; }
   .player-title p { @apply m-0 text-[.66rem] font-black tracking-[.16em] text-brand-bright uppercase; }

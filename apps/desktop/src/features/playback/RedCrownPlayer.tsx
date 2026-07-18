@@ -276,7 +276,7 @@ export function RedCrownPlayer({
         <header className="player-topbar">
           <button className="back-button player-back" onClick={onClose} type="button">
             <PlayerIcon name="back" />
-            <span>Back</span>
+            <span>Back to title</span>
           </button>
           <div className="player-title">
             <p>Now playing</p>
