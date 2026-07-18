@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use librqbit::api::TorrentIdOrHash;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, CreateTorrentOptions, Session,
-    SessionOptions, create_torrent,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, BlockingSpawner, CreateTorrentOptions,
+    ListenerMode, ListenerOptions, Session, SessionOptions, create_torrent,
 };
 use redcrown_core::{StreamCachePolicy, TrackerListConfig};
 use tempfile::tempdir;
@@ -30,7 +30,16 @@ const EXTERNAL_MAGNET_TIMEOUT: Duration = Duration::from_secs(180);
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "run through scripts/test-magnet.ps1 with an explicit public magnet"]
 async fn resolves_and_downloads_from_external_magnet() -> Result<(), Box<dyn Error>> {
+    let _diagnostics = redcrown_diagnostics::Diagnostics::initialize()?;
     let magnet = std::env::var("REDCROWN_TEST_MAGNET")?;
+    let metadata_timeout = std::env::var("REDCROWN_TEST_METADATA_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(EXTERNAL_MAGNET_TIMEOUT, Duration::from_secs);
+    let transfer_timeout = std::env::var("REDCROWN_TEST_TRANSFER_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(EXTERNAL_MAGNET_TIMEOUT, Duration::from_secs);
     let client_root = tempdir()?;
     let engine = TorrentEngine::start(
         client_root.path().to_path_buf(),
@@ -40,7 +49,9 @@ async fn resolves_and_downloads_from_external_magnet() -> Result<(), Box<dyn Err
     )
     .await?;
 
-    let listed = timeout(EXTERNAL_MAGNET_TIMEOUT, engine.resolve_metadata(&magnet)).await??;
+    let started = tokio::time::Instant::now();
+    let listed = timeout(metadata_timeout, engine.resolve_metadata(&magnet)).await??;
+    eprintln!("metadata resolved after {:?}", started.elapsed());
     let ticket = timeout(
         EXTERNAL_MAGNET_TIMEOUT,
         engine.start_resolved_playback(listed, None),
@@ -66,7 +77,8 @@ async fn resolves_and_downloads_from_external_magnet() -> Result<(), Box<dyn Err
         .into());
     }
     let mut received = 0_usize;
-    let deadline = tokio::time::Instant::now() + EXTERNAL_MAGNET_TIMEOUT;
+    let transfer_started = tokio::time::Instant::now();
+    let deadline = transfer_started + transfer_timeout;
     while received == 0 && tokio::time::Instant::now() < deadline {
         match timeout(Duration::from_secs(10), response.chunk()).await {
             Ok(Ok(Some(chunk))) => received = received.saturating_add(chunk.len()),
@@ -93,6 +105,10 @@ async fn resolves_and_downloads_from_external_magnet() -> Result<(), Box<dyn Err
     }
 
     assert!(received > 0, "the external swarm returned no media bytes");
+    eprintln!(
+        "first media bytes received after {:?}",
+        transfer_started.elapsed()
+    );
     engine.stop_playback(ticket.torrent_id).await?;
     engine.shutdown().await?;
     Ok(())
@@ -107,11 +123,12 @@ async fn media_bridge_transcodes_audio_and_exposes_subtitles() -> Result<(), Box
     create_media_fixture(&tools, seed_root.path(), &media_path).await?;
 
     let client_root = tempdir()?;
-    let engine = TorrentEngine::start(
+    let engine = TorrentEngine::start_with_peer_listener(
         client_root.path().to_path_buf(),
         StreamCachePolicy::standard(),
         TrackerListConfig::default(),
         tools.clone(),
+        "127.0.0.1:0".parse()?,
     )
     .await?;
     let (_seed_session, listed) = listed_from_local_seed(&engine, seed_root.path()).await?;
@@ -174,18 +191,23 @@ async fn listed_from_local_seed(
         seed_root,
         CreateTorrentOptions {
             name: Some("redcrown-media-bridge"),
+            trackers: Vec::new(),
             piece_length: Some(TEST_PIECE_BYTES),
         },
+        &BlockingSpawner::new(1),
     )
     .await?;
     let torrent_bytes = torrent.as_bytes()?;
     let seed_session = Session::new_with_opts(
         seed_root.to_path_buf(),
         SessionOptions {
-            disable_dht: true,
-            enable_upnp_port_forwarding: false,
+            dht: None,
             persistence: None,
-            listen_port_range: Some(16_301..16_401),
+            listen: Some(ListenerOptions {
+                mode: ListenerMode::TcpOnly,
+                listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                ..ListenerOptions::default()
+            }),
             ..SessionOptions::default()
         },
     )
@@ -203,12 +225,9 @@ async fn listed_from_local_seed(
         .into_handle()
         .ok_or("seed torrent did not return a managed handle")?;
     timeout(TEST_TIMEOUT, seed_handle.wait_until_completed()).await??;
-    let seed_address = SocketAddr::from((
-        [127, 0, 0, 1],
-        seed_session
-            .tcp_listen_port()
-            .ok_or("seed session did not bind a TCP port")?,
-    ));
+    let seed_address = seed_session
+        .listen_addr()
+        .ok_or("seed session did not bind a TCP port")?;
     let response = engine
         .api
         .session()
@@ -254,73 +273,18 @@ async fn downloads_prebuffers_and_serves_from_a_local_seed() -> Result<(), Box<d
     let media_path = seed_root.path().join("redcrown-transfer-test.mp4");
     let expected = transfer_fixture_bytes()?;
     tokio::fs::write(&media_path, &expected).await?;
-    let torrent = create_torrent(
-        seed_root.path(),
-        CreateTorrentOptions {
-            name: Some("redcrown-transfer-test"),
-            piece_length: Some(TEST_PIECE_BYTES),
-        },
-    )
-    .await?;
-    let torrent_bytes = torrent.as_bytes()?;
-
-    let seed_session = Session::new_with_opts(
-        seed_root.path().to_path_buf(),
-        SessionOptions {
-            disable_dht: true,
-            enable_upnp_port_forwarding: false,
-            persistence: None,
-            listen_port_range: Some(16_201..16_301),
-            ..SessionOptions::default()
-        },
-    )
-    .await?;
-    let seed_handle = seed_session
-        .add_torrent(
-            AddTorrent::from_bytes(torrent_bytes.clone()),
-            Some(AddTorrentOptions {
-                output_folder: Some(seed_root.path().to_string_lossy().into_owned()),
-                overwrite: true,
-                ..AddTorrentOptions::default()
-            }),
-        )
-        .await?
-        .into_handle()
-        .ok_or("seed torrent did not return a managed handle")?;
-    timeout(TEST_TIMEOUT, seed_handle.wait_until_completed()).await??;
-    let seed_address = SocketAddr::from((
-        [127, 0, 0, 1],
-        seed_session
-            .tcp_listen_port()
-            .ok_or("seed session did not bind a TCP port")?,
-    ));
-
     let client_root = tempdir()?;
-    let engine = TorrentEngine::start(
+    let engine = TorrentEngine::start_with_peer_listener(
         client_root.path().to_path_buf(),
         StreamCachePolicy::standard(),
         TrackerListConfig::default(),
         MediaTools::unavailable_for_transfer_test(),
+        "127.0.0.1:0".parse()?,
     )
     .await?;
-    let response = engine
-        .api
-        .session()
-        .add_torrent(
-            AddTorrent::from_bytes(torrent_bytes),
-            Some(AddTorrentOptions {
-                list_only: true,
-                ..AddTorrentOptions::default()
-            }),
-        )
-        .await?;
-    let mut listed = match response {
-        AddTorrentResponse::ListOnly(listed) => listed,
-        AddTorrentResponse::Added(_, _) | AddTorrentResponse::AlreadyManaged(_, _) => {
-            return Err("metadata request unexpectedly started a torrent".into());
-        }
-    };
-    listed.seen_peers = vec![seed_address];
+    let (seed_session, listed) = listed_from_local_seed(&engine, seed_root.path()).await?;
+    let torrent_bytes = listed.torrent_bytes.clone();
+    let info_hash = listed.info_hash.as_string();
 
     let ticket = engine.start_resolved_playback(listed, None).await?;
     timeout(TEST_TIMEOUT, engine.prebuffer(&ticket)).await??;
@@ -347,10 +311,61 @@ async fn downloads_prebuffers_and_serves_from_a_local_seed() -> Result<(), Box<d
         Some("magnet:?xt=urn:btih:local-redcrown-test")
     );
     assert_eq!(diagnostics.pieces.total, 16);
-    assert!(diagnostics.pieces.verified > 0);
+    assert!(diagnostics.pieces.available > 0);
+    assert!(diagnostics.pieces.downloaded_this_session > 0);
+    assert!(diagnostics.downloaded_this_session_bytes > 0);
     assert_eq!(diagnostics.peers.seeders, None);
 
     engine.cancel_preparation(preparation_id).await?;
+
+    let fastresume = client_root
+        .path()
+        .join(&info_hash)
+        .join(".rqbit-have-pieces");
+    assert!(fastresume.is_file());
+    let listed = match engine
+        .api
+        .session()
+        .add_torrent(
+            AddTorrent::from_bytes(torrent_bytes),
+            Some(AddTorrentOptions {
+                list_only: true,
+                ..AddTorrentOptions::default()
+            }),
+        )
+        .await?
+    {
+        AddTorrentResponse::ListOnly(listed) => listed,
+        AddTorrentResponse::Added(_, _) | AddTorrentResponse::AlreadyManaged(_, _) => {
+            return Err("cached torrent metadata unexpectedly started a transfer".into());
+        }
+    };
+    let resumed = engine.start_resolved_playback(listed, None).await?;
+    let resumed_handle = engine
+        .api
+        .mgr_handle(TorrentIdOrHash::Id(resumed.torrent_id))?;
+    timeout(TEST_TIMEOUT, resumed_handle.wait_until_initialized()).await??;
+    timeout(TEST_TIMEOUT, engine.prebuffer(&resumed)).await??;
+    let resumed_preparation_id = Uuid::new_v4();
+    *engine.preparation.lock().await = Some(Arc::new(PlaybackPreparation {
+        id: resumed_preparation_id,
+        source: "cached-test-torrent".to_owned(),
+        snapshot: RwLock::new(PreparationSnapshot {
+            stage: PlaybackStage::Ready,
+            ticket: Some(resumed.clone()),
+            error: None,
+        }),
+        task: Mutex::new(None),
+    }));
+    let resumed_diagnostics = engine.diagnostics(resumed_preparation_id).await?;
+    assert_eq!(
+        resumed_diagnostics.pieces.available,
+        u64::from(resumed_diagnostics.pieces.total)
+    );
+    assert_eq!(resumed_diagnostics.pieces.downloaded_this_session, 0);
+    assert_eq!(resumed_diagnostics.downloaded_this_session_bytes, 0);
+
+    engine.cancel_preparation(resumed_preparation_id).await?;
     engine.shutdown().await?;
     seed_session.cancellation_token().cancel();
     Ok(())

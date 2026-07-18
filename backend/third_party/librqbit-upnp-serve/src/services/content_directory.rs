@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use axum::{body::Bytes, extract::State, response::IntoResponse};
 use browse::response::ItemOrContainer;
 use bstr::BStr;
-use http::{header::CONTENT_TYPE, HeaderMap, StatusCode};
+use http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use tracing::{debug, trace};
 
 use crate::{
@@ -17,7 +17,7 @@ use crate::{
 pub mod browse {
     pub mod request {
         use anyhow::Context;
-        use serde::Deserialize;
+        use serde_derive::Deserialize;
 
         #[derive(Deserialize)]
         struct Envelope {
@@ -111,7 +111,7 @@ pub mod browse {
 
                 fn container(item: &Container) -> String {
                     let child_count_tag = match item.children_count {
-                        Some(cc) => format!("childCount=\"{}\"", cc),
+                        Some(cc) => format!("childCount=\"{cc}\""),
                         None => String::new(),
                     };
                     format!(
@@ -198,11 +198,11 @@ pub mod get_system_update_id {
 
     pub(crate) fn render_response(update_id: u64) -> String {
         format!(
-                include_str!(
-                    "../resources/templates/content_directory/control/get_system_update_id/response.tmpl.xml"
-                ),
-                id = update_id
-            )
+            include_str!(
+                "../resources/templates/content_directory/control/get_system_update_id/response.tmpl.xml"
+            ),
+            id = update_id
+        )
     }
 }
 
@@ -276,11 +276,10 @@ pub(crate) async fn http_handler(
     };
     match action.as_ref() {
         SOAP_ACTION_CONTENT_DIRECTORY_BROWSE => {
-            let http_hostname = headers
+            let http_host = headers
                 .get("host")
-                .and_then(|h| std::str::from_utf8(h.as_bytes()).ok())
-                .and_then(|h| h.split(':').next());
-            let http_hostname = match http_hostname {
+                .and_then(|h| std::str::from_utf8(h.as_bytes()).ok());
+            let http_hostname = match http_host {
                 Some(h) => h,
                 None => return StatusCode::BAD_REQUEST.into_response(),
             };
@@ -338,7 +337,7 @@ pub(crate) async fn http_handler(
 
 pub trait ContentDirectoryBrowseProvider: Send + Sync {
     fn browse_direct_children(&self, parent_id: usize, http_hostname: &str)
-        -> Vec<ItemOrContainer>;
+    -> Vec<ItemOrContainer>;
     fn browse_metadata(&self, object_id: usize, http_hostname: &str) -> Vec<ItemOrContainer>;
 }
 

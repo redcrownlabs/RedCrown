@@ -20,10 +20,11 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use librqbit::api::TorrentIdOrHash;
-use librqbit::dht::PersistentDhtConfig;
+use librqbit::dht::DhtPersistenceConfig;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ListOnlyResponse, Session,
-    SessionOptions,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, DhtSessionConfig, ListOnlyResponse,
+    ListenerMode, ListenerOptions, PeerConnectionOptions, Session, SessionOptions,
+    TorrentStatsState,
 };
 use redcrown_core::{StreamCachePolicy, TrackerListConfig};
 use serde::{Deserialize, Serialize};
@@ -47,10 +48,6 @@ use tracker_list::TrackerList;
 const STREAM_READ_BUFFER_BYTES: usize = 64 * 1024;
 /// DHT routing state is separate from expiring media-cache entries.
 const DHT_STATE_FILENAME: &str = ".redcrown-dht.json";
-/// First port in IANA's dynamic/private range used for inbound peers.
-const PEER_LISTEN_PORT_START: u16 = 49_152;
-/// Exclusive upper bound accepted by librqbit for inbound peer ports.
-const PEER_LISTEN_PORT_END: u16 = 65_535;
 /// Startup buffering balances prompt playback against resilience to peer jitter.
 const MIN_START_BUFFER_BYTES: u64 = 8 * 1024 * 1024;
 /// Large files must not require an excessive wait before playback can begin.
@@ -61,6 +58,10 @@ const START_BUFFER_DIVISOR: u64 = 100;
 const CACHE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// The default public list updates daily, so more frequent polling adds little value.
 const TRACKER_LIST_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Metadata candidates must churn quickly through stale public peer lists.
+const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+/// Metadata blocks are small; a silent peer should not occupy a slot for long.
+const METADATA_READ_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Media inspection must fail instead of hanging playback indefinitely.
 const MEDIA_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// `FFmpeg` stderr is bounded before it enters structured diagnostics.
@@ -160,6 +161,8 @@ pub struct MediaTrack {
 pub enum PlaybackStage {
     /// Resolving magnet metadata and selecting the requested media file.
     ResolvingMetadata,
+    /// Validating an existing stream-cache entry before it can be trusted.
+    ValidatingCache,
     /// Prioritizing and buffering the beginning of the selected file.
     Buffering,
     /// The loopback stream is ready for the media element.
@@ -182,7 +185,7 @@ pub struct PlaybackStatus {
     /// Current binary mebibytes downloaded per second.
     pub download_mib_per_second: f64,
     /// Number of currently connected peers.
-    pub connected_peers: usize,
+    pub connected_peers: u32,
     /// Stream ticket after metadata and file selection complete.
     pub ticket: Option<PlaybackTicket>,
     /// Bounded failure message for the renderer.
@@ -193,26 +196,28 @@ pub struct PlaybackStatus {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct PeerDiagnostics {
     /// Peers waiting for connection attempts.
-    pub queued: usize,
+    pub queued: u32,
     /// Peers with an in-progress connection.
-    pub connecting: usize,
+    pub connecting: u32,
     /// Peers with an active protocol connection.
-    pub connected: usize,
+    pub connected: u32,
     /// Unique peers observed by discovery mechanisms.
-    pub seen: usize,
+    pub seen: u32,
     /// Peers currently considered unreachable or invalid.
-    pub dead: usize,
+    pub dead: u32,
     /// Connected peers that do not have currently needed pieces.
-    pub not_needed: usize,
+    pub not_needed: u32,
     /// Connected seeders when the engine exposes remote completion state.
-    pub seeders: Option<usize>,
+    pub seeders: Option<u32>,
 }
 
 /// Summarizes verified `BitTorrent` pieces.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct PieceDiagnostics {
-    /// Pieces downloaded and hash-verified in this live session.
-    pub verified: u64,
+    /// Pieces already verified and available from storage.
+    pub available: u64,
+    /// Pieces downloaded and hash-verified in this engine session.
+    pub downloaded_this_session: u64,
     /// Total pieces described by torrent metadata.
     pub total: u32,
     /// Mean verified-piece download duration in milliseconds.
@@ -245,6 +250,8 @@ pub struct TorrentDiagnostics {
     pub trackers: Vec<String>,
     /// Bytes uploaded to connected peers.
     pub uploaded_bytes: u64,
+    /// Bytes downloaded and hash-verified in this engine session.
+    pub downloaded_this_session_bytes: u64,
     /// Current binary mebibytes uploaded per second.
     pub upload_mib_per_second: f64,
     /// Peer discovery and connection counters.
@@ -326,13 +333,30 @@ impl TorrentEngine {
         tracker_list_config: TrackerListConfig,
         media_tools: MediaTools,
     ) -> Result<Self, TorrentError> {
+        Self::start_with_peer_listener(
+            cache_root,
+            cache_policy,
+            tracker_list_config,
+            media_tools,
+            ListenerOptions::default().listen_addr,
+        )
+        .await
+    }
+
+    async fn start_with_peer_listener(
+        cache_root: PathBuf,
+        cache_policy: StreamCachePolicy,
+        tracker_list_config: TrackerListConfig,
+        media_tools: MediaTools,
+        peer_listen_addr: SocketAddr,
+    ) -> Result<Self, TorrentError> {
         let cache = Arc::new(
             StreamCache::open(cache_root.clone(), cache_policy)
                 .await
                 .map_err(|error| TorrentError::new(error.user_message()))?,
         );
         let tracker_list = TrackerList::open(cache_root.clone(), tracker_list_config).await?;
-        let options = session_options(&cache_root);
+        let options = session_options(&cache_root, peer_listen_addr);
         let session = Session::new_with_opts(cache_root, options)
             .await
             .map_err(|error| {
@@ -518,14 +542,18 @@ impl TorrentEngine {
             .file_progress
             .get(ticket.file_id)
             .copied()
-            .unwrap_or(stats.progress_bytes)
+            .unwrap_or_default()
             .min(ticket.file_length);
         let (download_mib_per_second, connected_peers) = stats.live.map_or((0.0, 0), |live| {
             (live.download_speed.mbps, live.snapshot.peer_stats.live)
         });
         Ok(PlaybackStatus {
             preparation_id,
-            stage: snapshot.stage,
+            stage: if matches!(stats.state, TorrentStatsState::Initializing) {
+                PlaybackStage::ValidatingCache
+            } else {
+                snapshot.stage
+            },
             downloaded_bytes,
             total_bytes: ticket.file_length,
             download_mib_per_second,
@@ -537,7 +565,7 @@ impl TorrentEngine {
 
     /// Returns live torrent internals for one playback preparation.
     ///
-    /// Seeder classification remains `None` because librqbit 8.1.1 does not
+    /// Seeder classification remains `None` because librqbit does not
     /// expose remote bitfield completion through its stable aggregate API.
     ///
     /// # Errors
@@ -573,6 +601,7 @@ impl TorrentEngine {
                 magnet_link,
                 trackers,
                 uploaded_bytes: 0,
+                downloaded_this_session_bytes: 0,
                 upload_mib_per_second: 0.0,
                 peers: PeerDiagnostics::default(),
                 pieces: PieceDiagnostics::default(),
@@ -584,11 +613,13 @@ impl TorrentEngine {
             .mgr_handle(TorrentIdOrHash::Id(ticket.torrent_id))
             .map_err(|error| TorrentError::new(format!("failed to inspect torrent: {error}")))?;
         let stats = handle.stats();
-        let total_pieces = handle
-            .with_metadata(|metadata| metadata.lengths.total_pieces())
+        let (available_piece_bits, total_pieces) = self
+            .api
+            .api_dump_haves(TorrentIdOrHash::Id(ticket.torrent_id))
             .map_err(|error| {
                 TorrentError::new(format!("failed to inspect torrent pieces: {error}"))
             })?;
+        let available_pieces = u64::try_from(available_piece_bits.count_ones()).unwrap_or(u64::MAX);
         let mut trackers = handle
             .shared()
             .trackers
@@ -615,7 +646,8 @@ impl TorrentEngine {
                         seeders: None,
                     },
                     PieceDiagnostics {
-                        verified: live.snapshot.downloaded_and_checked_pieces,
+                        available: available_pieces,
+                        downloaded_this_session: live.snapshot.downloaded_and_checked_pieces,
                         total: total_pieces,
                         average_download_ms,
                     },
@@ -629,6 +661,10 @@ impl TorrentEngine {
             magnet_link,
             trackers,
             uploaded_bytes: stats.uploaded_bytes,
+            downloaded_this_session_bytes: stats
+                .live
+                .as_ref()
+                .map_or(0, |live| live.snapshot.downloaded_and_checked_bytes),
             upload_mib_per_second,
             peers,
             pieces,
@@ -721,7 +757,7 @@ impl TorrentEngine {
         listed: ListOnlyResponse,
         file_path: Option<&str>,
     ) -> Result<PlaybackTicket, TorrentError> {
-        let files = torrent_files(&listed)?;
+        let files = torrent_files(&listed);
         let selected = select_media_file(&files, file_path)?.clone();
         let cache_key = CacheKey::parse(listed.info_hash.as_string())
             .map_err(|error| TorrentError::new(error.user_message()))?;
@@ -869,7 +905,7 @@ impl TorrentEngine {
         handle.wait_until_initialized().await.map_err(|error| {
             TorrentError::new(format!("torrent initialization failed: {error}"))
         })?;
-        let mut stream = handle.stream(ticket.file_id).map_err(|error| {
+        let mut stream = handle.stream(ticket.file_id).await.map_err(|error| {
             TorrentError::new(format!("failed to open startup buffer: {error}"))
         })?;
         let target = start_buffer_target(ticket.file_length);
@@ -908,6 +944,11 @@ impl TorrentEngine {
                 Some(AddTorrentOptions {
                     list_only: true,
                     trackers,
+                    peer_opts: Some(PeerConnectionOptions {
+                        connect_timeout: Some(METADATA_CONNECT_TIMEOUT),
+                        read_write_timeout: Some(METADATA_READ_WRITE_TIMEOUT),
+                        ..PeerConnectionOptions::default()
+                    }),
                     ..AddTorrentOptions::default()
                 }),
             )
@@ -1034,20 +1075,29 @@ impl TorrentEngine {
     }
 }
 
-fn session_options(cache_root: &FsPath) -> SessionOptions {
+fn session_options(cache_root: &FsPath, peer_listen_addr: SocketAddr) -> SessionOptions {
     SessionOptions {
-        // Trackers reject port zero and inbound connections improve swarm
-        // participation. The broad dynamic/private range lets librqbit select
-        // the first available port without reserving an application port.
-        listen_port_range: Some(PEER_LISTEN_PORT_START..PEER_LISTEN_PORT_END),
-        disable_dht_persistence: false,
-        dht_config: Some(PersistentDhtConfig {
-            config_filename: Some(cache_root.join(DHT_STATE_FILENAME)),
-            ..PersistentDhtConfig::default()
+        // A shared TCP/uTP listener lets rqbit race both peer transports while
+        // advertising one OS-assigned port. uTP is required for swarms whose
+        // peers do not accept TCP; disabling it regresses cold magnet startup.
+        listen: Some(ListenerOptions {
+            mode: ListenerMode::TcpAndUtp,
+            listen_addr: peer_listen_addr,
+            ..ListenerOptions::default()
+        }),
+        dht: Some(DhtSessionConfig {
+            persistence: Some(DhtPersistenceConfig {
+                config_filename: Some(cache_root.join(DHT_STATE_FILENAME)),
+                ..DhtPersistenceConfig::default()
+            }),
+            ..DhtSessionConfig::default()
         }),
         // Torrent membership remains session-scoped. RedCrown persists only
-        // DHT discovery state; cache manifests own media expiration separately.
-        fastresume: false,
+        // DHT discovery and verified-piece state. The latter lives inside each
+        // expiring cache entry, so media and verification state are evicted
+        // together without restoring torrents as persistent downloads.
+        fastresume: true,
+        fastresume_root: Some(cache_root.to_path_buf()),
         persistence: None,
         ..SessionOptions::default()
     }
@@ -1177,21 +1227,17 @@ fn normalized_torrent_path(path: &str) -> String {
         .to_owned()
 }
 
-fn torrent_files(listed: &ListOnlyResponse) -> Result<Vec<TorrentFile>, TorrentError> {
-    Ok(listed
+fn torrent_files(listed: &ListOnlyResponse) -> Vec<TorrentFile> {
+    listed
         .info
         .iter_file_details()
-        .map_err(|error| TorrentError::new(format!("failed to inspect torrent files: {error}")))?
         .enumerate()
-        .filter_map(|(id, details)| {
-            let name = details.filename.to_string().ok()?;
-            Some(TorrentFile {
-                id,
-                name,
-                length: details.len,
-            })
+        .map(|(id, details)| TorrentFile {
+            id,
+            name: details.filename.to_string(),
+            length: details.len,
         })
-        .collect())
+        .collect()
 }
 
 fn is_supported_media(name: &str) -> bool {
@@ -1585,6 +1631,7 @@ async fn build_stream_response(
 ) -> Result<Response, TorrentError> {
     let mut stream = api
         .api_stream(TorrentIdOrHash::Id(torrent_id), file_id)
+        .await
         .map_err(|error| TorrentError::new(format!("failed to open media stream: {error}")))?;
     let total_length = stream.len();
     let range = parse_range(headers.get(RANGE), total_length)?;
@@ -1704,30 +1751,31 @@ mod integration_tests;
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
     use std::path::Path;
 
     use axum::http::HeaderValue;
 
     use super::{
-        DHT_STATE_FILENAME, MAX_START_BUFFER_BYTES, MIN_START_BUFFER_BYTES, PEER_LISTEN_PORT_END,
-        PEER_LISTEN_PORT_START, TorrentFile, magnet_link, parse_probe_output, parse_range,
-        select_media_file, session_options, start_buffer_target,
+        DHT_STATE_FILENAME, ListenerMode, MAX_START_BUFFER_BYTES, MIN_START_BUFFER_BYTES,
+        TorrentFile, magnet_link, parse_probe_output, parse_range, select_media_file,
+        session_options, start_buffer_target,
     };
 
     #[test]
     fn dht_routing_state_is_persistent_and_cache_scoped() {
         let cache_root = Path::new("stream-cache");
-        let options = session_options(cache_root);
-        let dht_config = options.dht_config.expect("DHT persistence config");
+        let options = session_options(cache_root, (Ipv4Addr::LOCALHOST, 0).into());
+        let dht = options.dht.expect("DHT config");
+        let persistence = dht.persistence.expect("DHT persistence config");
 
-        assert!(!options.disable_dht);
-        assert!(!options.disable_dht_persistence);
         assert_eq!(
-            dht_config.config_filename.as_deref(),
+            persistence.config_filename.as_deref(),
             Some(cache_root.join(DHT_STATE_FILENAME).as_path())
         );
         assert!(options.persistence.is_none());
-        assert!(!options.fastresume);
+        assert!(options.fastresume);
+        assert_eq!(options.fastresume_root.as_deref(), Some(cache_root));
     }
 
     #[test]
@@ -1795,13 +1843,13 @@ mod tests {
     }
 
     #[test]
-    fn session_announces_a_bound_peer_port() {
-        let options = session_options(Path::new("cache"));
+    fn session_enables_tcp_and_utp_on_an_os_assigned_port() {
+        let options = session_options(Path::new("cache"), (Ipv4Addr::LOCALHOST, 0).into());
+        let listen = options.listen.expect("peer listener");
 
-        assert_eq!(
-            options.listen_port_range,
-            Some(PEER_LISTEN_PORT_START..PEER_LISTEN_PORT_END)
-        );
+        assert!(matches!(listen.mode, ListenerMode::TcpAndUtp));
+        assert!(listen.listen_addr.ip().is_loopback());
+        assert_eq!(listen.listen_addr.port(), 0);
     }
 
     #[test]

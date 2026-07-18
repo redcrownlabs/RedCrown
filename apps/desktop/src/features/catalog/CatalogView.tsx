@@ -111,7 +111,7 @@ export function CatalogView({
     );
     observer.observe(anchor);
     return () => observer.disconnect();
-  }, [hasMore, loadMore]);
+  }, [hasMore, loadMore, loading]);
 
   const genres = genreOptions(kind);
   return (

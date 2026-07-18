@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use super::{live::stats::snapshot::StatsSnapshot, TorrentStateLive};
+use super::{TorrentStateLive, live::stats::snapshot::StatsSnapshot};
 use size_format::SizeFormatterBinary as SF;
 
 #[derive(Serialize, Default, Debug)]
@@ -141,11 +141,11 @@ fn format_seconds_to_time(seconds: u64, f: &mut core::fmt::Formatter<'_>) -> cor
     let seconds = seconds % 60;
 
     if hours > 0 {
-        write!(f, "{}h {}m", hours, minutes)
+        write!(f, "{hours}h {minutes}m")
     } else if minutes > 0 {
-        write!(f, "{}m {}s", minutes, seconds)
+        write!(f, "{minutes}m {seconds}s")
     } else {
-        write!(f, "{}s", seconds)
+        write!(f, "{seconds}s")
     }
 }
 
@@ -159,7 +159,7 @@ impl core::fmt::Display for DurationWithHumanReadable {
 
 impl core::fmt::Debug for DurationWithHumanReadable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self)
+        write!(f, "{self}")
     }
 }
 
@@ -175,7 +175,7 @@ impl Serialize for DurationWithHumanReadable {
         }
         Tmp {
             duration: self.0,
-            human_readable: format!("{}", self),
+            human_readable: self.to_string(),
         }
         .serialize(serializer)
     }
@@ -189,6 +189,11 @@ pub struct Speed {
 impl Speed {
     fn new(mbps: f64) -> Self {
         Self { mbps }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn as_bytes(&self) -> u64 {
+        (self.mbps * 1024f64 * 1024f64) as u64
     }
 }
 
@@ -206,7 +211,7 @@ impl core::fmt::Display for Speed {
 
 impl core::fmt::Debug for Speed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self)
+        write!(f, "{self}")
     }
 }
 
@@ -222,7 +227,7 @@ impl Serialize for Speed {
         }
         Tmp {
             mbps: self.mbps,
-            human_readable: format!("{}", self),
+            human_readable: self.to_string(),
         }
         .serialize(serializer)
     }

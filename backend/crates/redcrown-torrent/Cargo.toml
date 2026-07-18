@@ -25,4 +25,5 @@ uuid.workspace = true
 workspace = true
 
 [dev-dependencies]
+redcrown-diagnostics = { path = "../redcrown-diagnostics" }
 tempfile.workspace = true

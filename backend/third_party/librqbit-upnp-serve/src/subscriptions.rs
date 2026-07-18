@@ -6,11 +6,11 @@ use librqbit_core::spawn_utils::spawn_with_cancel;
 use parking_lot::RwLock;
 use std::{
     collections::HashMap,
-    sync::{atomic::Ordering, Arc},
+    sync::{Arc, atomic::Ordering},
     time::Duration,
 };
-use tokio::sync::{broadcast::error::RecvError, Notify};
-use tracing::{debug, error_span, trace, warn, Instrument};
+use tokio::sync::{Notify, broadcast::error::RecvError};
+use tracing::{Instrument, debug, debug_span, trace, warn};
 
 pub struct Subscription {
     #[allow(dead_code)]
@@ -280,7 +280,7 @@ impl UpnpServerStateInner {
                         }
                     }
                 }
-                .instrument(error_span!("system-update-id-notifier"));
+                .instrument(debug_span!("system-update-id-notifier"));
 
                 let timeout_notifier = async {
                     let mut timeout = timeout;
@@ -297,7 +297,7 @@ impl UpnpServerStateInner {
                             }
                         }
                     }
-                }.instrument(error_span!("timeout-killer"));
+                }.instrument(debug_span!("timeout-killer"));
 
                 tokio::select! {
                     r = system_update_id_notifier => r,
@@ -306,8 +306,9 @@ impl UpnpServerStateInner {
             }
         };
 
-        spawn_with_cancel(
-            error_span!(parent: pspan, "subscription-manager", sid, %url, service="ContentDirectory"),
+        spawn_with_cancel::<anyhow::Error>(
+            debug_span!(parent: pspan, "subscription-manager", sid, %url, service="ContentDirectory"),
+            "upnp-subscription-manager:ContentDirectory",
             token,
             subscription_manager,
         );
@@ -348,14 +349,15 @@ impl UpnpServerStateInner {
                             }
                         }
                     }
-                }.instrument(error_span!("timeout-killer"));
+                }.instrument(debug_span!("timeout-killer"));
 
                 timeout_notifier.await
             }
         };
 
-        spawn_with_cancel(
-            error_span!(parent: pspan, "subscription-manager", sid, %url, service="ConnectionManager"),
+        spawn_with_cancel::<anyhow::Error>(
+            debug_span!(parent: pspan, "subscription-manager", sid, %url, service="ConnectionManager"),
+            "upnp-subscription-manager:ConnectionManager",
             token,
             subscription_manager,
         );

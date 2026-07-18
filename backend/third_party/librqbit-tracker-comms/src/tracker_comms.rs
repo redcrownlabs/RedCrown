@@ -1,19 +1,24 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::net::SocketAddrV4;
+use std::net::SocketAddrV6;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::bail;
 use anyhow::Context;
+use anyhow::bail;
+use backon::ExponentialBuilder;
+use backon::Retryable;
+use futures::FutureExt;
+use futures::StreamExt;
 use futures::future::Either;
 use futures::stream::BoxStream;
 use futures::stream::FuturesUnordered;
-use futures::FutureExt;
-use futures::StreamExt;
-use tracing::debug;
-use tracing::error_span;
-use tracing::trace;
 use tracing::Instrument;
+use tracing::debug;
+use tracing::debug_span;
+use tracing::trace;
+use tracing::trace_span;
 use url::Url;
 
 use crate::tracker_comms_http;
@@ -27,8 +32,10 @@ pub struct TrackerComms {
     stats: Box<dyn TorrentStatsProvider>,
     force_tracker_interval: Option<Duration>,
     tx: Sender,
-    tcp_listen_port: Option<u16>,
+    // This MUST be set as trackers don't work with 0 port.
+    announce_port: u16,
     reqwest_client: reqwest::Client,
+    key: u32,
 }
 
 #[derive(Default)]
@@ -89,7 +96,49 @@ impl std::fmt::Debug for SupportedTracker {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum UdpTrackerResolveResult {
+    One(SocketAddr),
+    Two(SocketAddrV4, SocketAddrV6),
+}
+
+async fn udp_tracker_to_socket_addrs(
+    host: url::Host<&str>,
+    port: u16,
+) -> anyhow::Result<UdpTrackerResolveResult> {
+    let res = match host {
+        url::Host::Domain(name) => {
+            // Use the first IPv4 and the first IPv6 addresses only.
+
+            let mut v4: Option<SocketAddrV4> = None;
+            let mut v6: Option<SocketAddrV6> = None;
+            for addr in tokio::net::lookup_host((name, port))
+                .await
+                .with_context(|| format!("error looking up hostname {name}"))?
+            {
+                match (v4, v6, addr) {
+                    (None, _, SocketAddr::V4(addr)) => v4 = Some(addr),
+                    (_, None, SocketAddr::V6(addr)) => v6 = Some(addr),
+                    _ => continue,
+                }
+            }
+            let res = match (v4, v6) {
+                (Some(v4), Some(v6)) => UdpTrackerResolveResult::Two(v4, v6),
+                (Some(v4), None) => UdpTrackerResolveResult::One(v4.into()),
+                (None, Some(v6)) => UdpTrackerResolveResult::One(v6.into()),
+                _ => anyhow::bail!("zero addresses returned looking up {name}"),
+            };
+            trace!(?res, "resolved");
+            res
+        }
+        url::Host::Ipv4(addr) => UdpTrackerResolveResult::One((addr, port).into()),
+        url::Host::Ipv6(addr) => UdpTrackerResolveResult::One((addr, port).into()),
+    };
+    Ok(res)
+}
+
 impl TrackerComms {
+    // TODO: fix too many args
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         info_hash: Id20,
@@ -97,7 +146,7 @@ impl TrackerComms {
         trackers: HashSet<Url>,
         stats: Box<dyn TorrentStatsProvider>,
         force_interval: Option<Duration>,
-        tcp_listen_port: Option<u16>,
+        announce_port: u16,
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
     ) -> Option<BoxStream<'static, SocketAddr>> {
@@ -107,7 +156,7 @@ impl TrackerComms {
                 "http" | "https" => Some(SupportedTracker::Http(t)),
                 "udp" => Some(SupportedTracker::Udp(t)),
                 _ => {
-                    debug!("unsuppoted tracker URL: {}", t);
+                    debug!("unsupported tracker URL: {}", t);
                     None
                 }
             })
@@ -129,8 +178,9 @@ impl TrackerComms {
                 stats,
                 force_tracker_interval: force_interval,
                 tx,
-                tcp_listen_port,
-                reqwest_client
+                announce_port,
+                reqwest_client,
+                key: rand::random(),
             });
             let mut futures = FuturesUnordered::new();
             for tracker in trackers {
@@ -166,13 +216,13 @@ impl TrackerComms {
         let info_hash = self.info_hash;
         match url {
             SupportedTracker::Udp(url) => {
-                let span = error_span!(parent: None, "udp_tracker", tracker = %url, info_hash = ?info_hash);
+                let span = debug_span!(parent: None, "udp_tracker", tracker = %url, info_hash = ?info_hash);
                 self.task_single_tracker_monitor_udp(url, client.clone())
                     .instrument(span)
                     .right_future()
             }
             SupportedTracker::Http(url) => {
-                let span = error_span!(
+                let span = debug_span!(
                     parent: None,
                     "http_tracker",
                     tracker = %url,
@@ -185,70 +235,87 @@ impl TrackerComms {
         }
     }
 
-    async fn task_single_tracker_monitor_http(&self, mut tracker_url: Url) -> anyhow::Result<()> {
-        let mut event = Some(tracker_comms_http::TrackerRequestEvent::Started);
+    async fn task_single_tracker_monitor_http(&self, tracker_url: Url) -> anyhow::Result<()> {
         trace!(url=%tracker_url, "starting monitor");
+        let mut event = Some(tracker_comms_http::TrackerRequestEvent::Started);
+
         loop {
-            let stats = self.stats.get();
-            let request = tracker_comms_http::TrackerRequest {
-                info_hash: self.info_hash,
-                peer_id: self.peer_id,
-                port: self.tcp_listen_port.unwrap_or(0),
-                uploaded: stats.uploaded_bytes,
-                downloaded: stats.downloaded_bytes,
-                left: stats.get_left_to_download_bytes(),
-                compact: true,
-                no_peer_id: false,
-                event,
-                ip: None,
-                numwant: None,
-                key: None,
-                trackerid: None,
-            };
+            let interval = (|| self.tracker_one_request_http(&tracker_url, event))
+                .retry(
+                    ExponentialBuilder::new()
+                        .without_max_times()
+                        .with_jitter()
+                        .with_factor(2.)
+                        .with_min_delay(Duration::from_secs(10))
+                        .with_max_delay(Duration::from_secs(600)),
+                )
+                .notify(|err, retry_in| debug!(?retry_in, "error calling tracker: {err:#}"))
+                .await
+                .context("this shouldn't fail")?;
 
-            let request_query = request.as_querystring();
-            tracker_url = announce_url(&tracker_url, &request_query);
-
-            match self.tracker_one_request_http(tracker_url.clone()).await {
-                Ok(interval) => {
-                    event = None;
-                    let interval = self
-                        .force_tracker_interval
-                        .unwrap_or_else(|| Duration::from_secs(interval));
-                    debug!(
-                        "sleeping for {:?} after calling tracker {}",
-                        interval,
-                        tracker_url.host().unwrap()
-                    );
-                    tokio::time::sleep(interval).await;
-                }
-                Err(e) => {
-                    debug!("error calling the tracker {}: {:#}", tracker_url, e);
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                }
-            };
+            event = None;
+            let interval = self.force_tracker_interval.unwrap_or(interval);
+            debug!("sleeping for {:?} after calling tracker", interval);
+            tokio::time::sleep(interval).await;
         }
     }
 
-    async fn tracker_one_request_http(&self, tracker_url: Url) -> anyhow::Result<u64> {
-        debug!(url = %tracker_url, "calling tracker over http");
-        let response: reqwest::Response = self.reqwest_client.get(tracker_url).send().await?;
+    async fn tracker_one_request_http(
+        &self,
+        tracker_url: &Url,
+        event: Option<tracker_comms_http::TrackerRequestEvent>,
+    ) -> anyhow::Result<Duration> {
+        let stats = self.stats.get();
+        let request = tracker_comms_http::TrackerRequest {
+            info_hash: &self.info_hash,
+            peer_id: &self.peer_id,
+            port: self.announce_port,
+            uploaded: stats.uploaded_bytes,
+            downloaded: stats.downloaded_bytes,
+            left: stats.get_left_to_download_bytes(),
+            compact: true,
+            no_peer_id: false,
+            event,
+            ip: None,
+            numwant: None,
+            key: Some(self.key),
+            trackerid: None,
+        };
+
+        let mut url = tracker_url.clone();
+
+        let mut queries = request.as_querystring();
+        if let Some(url_query) = url.query() {
+            queries.push_str(&format!("&{url_query}"));
+        }
+        url.set_query(Some(&queries));
+
+        let response: reqwest::Response = self.reqwest_client.get(url).send().await?;
         if !response.status().is_success() {
             anyhow::bail!("tracker responded with {:?}", response.status());
         }
         let bytes = response.bytes().await?;
-        if let Ok(error) = bencode::from_bytes::<tracker_comms_http::TrackerError>(&bytes) {
+        if let Ok((error, _)) =
+            bencode::from_bytes_with_rest::<tracker_comms_http::TrackerError>(&bytes)
+        {
             anyhow::bail!(
                 "tracker returned failure. Failure reason: {}",
                 error.failure_reason
             )
         };
-        let response = bencode::from_bytes::<tracker_comms_http::TrackerResponse>(&bytes)?;
+        let response = bencode::from_bytes_with_rest::<tracker_comms_http::TrackerResponse>(&bytes)
+            .map_err(|e| {
+                tracing::trace!("error deserializing TrackerResponse: {e:#}");
+                e.into_kind()
+            })?
+            .0;
 
-        for peer in response.peers.iter_sockaddrs() {
+        for peer in response.iter_peers() {
             self.tx.send(peer).await?;
         }
-        Ok(response.interval)
+        Ok(Duration::from_secs(
+            response.min_interval.unwrap_or(response.interval),
+        ))
     }
 
     async fn task_single_tracker_monitor_udp(
@@ -256,129 +323,116 @@ impl TrackerComms {
         url: Url,
         client: UdpTrackerClient,
     ) -> anyhow::Result<()> {
-        use tracker_comms_udp::*;
-
         if url.scheme() != "udp" {
-            bail!("expected UDP scheme in {}", url);
+            bail!("expected UDP scheme in {url}");
         }
-        let hp: (String, u16) = (
-            url.host_str().context("missing host")?.to_owned(),
+        let (host, port) = (
+            url.host().context("missing host")?,
             url.port().context("missing port")?,
         );
 
         let mut sleep_interval: Option<Duration> = None;
+        let mut prev_addrs: Option<UdpTrackerResolveResult> = None;
         loop {
             if let Some(i) = sleep_interval {
                 trace!(interval=?sleep_interval, "sleeping");
                 tokio::time::sleep(i).await;
             }
 
-            let stats = self.stats.get();
-            let request = AnnounceFields {
-                info_hash: self.info_hash,
-                peer_id: self.peer_id,
-                downloaded: stats.downloaded_bytes,
-                left: stats.get_left_to_download_bytes(),
-                uploaded: stats.uploaded_bytes,
-                event: match stats.torrent_state {
-                    TrackerCommsStatsState::None => EVENT_NONE,
-                    TrackerCommsStatsState::Initializing => EVENT_STARTED,
-                    TrackerCommsStatsState::Paused => EVENT_STOPPED,
-                    TrackerCommsStatsState::Live => {
-                        if stats.is_completed() {
-                            EVENT_COMPLETED
-                        } else {
-                            EVENT_STARTED
+            // This should retry forever until the addrs are resolved.
+            let addrs = (async || {
+                udp_tracker_to_socket_addrs(host.clone(), port)
+                    .instrument(trace_span!("resolve", ?host))
+                    .await
+                    .or_else(|err| prev_addrs.ok_or(err))
+            })
+            .retry(
+                ExponentialBuilder::new()
+                    .without_max_times()
+                    .with_max_delay(Duration::from_secs(60))
+                    .with_jitter(),
+            )
+            .notify(|err, retry| debug!(retry_in=?retry, "error resolving tracker: {err:#}"))
+            .await
+            .context("this shouldn't happen: failed resolving tracker addrs")?;
+
+            prev_addrs = Some(addrs);
+
+            match addrs {
+                UdpTrackerResolveResult::One(addr) => {
+                    match self
+                        .tracker_one_request_udp(addr, &client)
+                        .instrument(trace_span!("udp request", ?addr))
+                        .await
+                    {
+                        Ok(sleep) => sleep_interval = Some(sleep),
+                        Err(_) => {
+                            sleep_interval = Some(sleep_interval.unwrap_or(Duration::from_secs(60)))
                         }
                     }
-                },
-                key: 0, // whatever that is?
-                port: self.tcp_listen_port.unwrap_or(0),
-            };
-
-            match client.announce(&hp, request).await {
-                Ok(response) => {
-                    trace!(len = response.addrs.len(), "received announce response");
-                    for addr in response.addrs {
-                        self.tx
-                            .send(SocketAddr::V4(addr))
-                            .await
-                            .context("rx closed")?;
-                    }
-                    let new_interval = response.interval.max(5);
-                    let new_interval = Duration::from_secs(new_interval as u64);
-                    sleep_interval = Some(self.force_tracker_interval.unwrap_or(new_interval));
                 }
-                Err(e) => {
-                    debug!(url = %url, "error reading announce response: {e:#}");
-                    if sleep_interval.is_none() {
-                        sleep_interval = Some(
-                            self.force_tracker_interval
-                                .unwrap_or(Duration::from_secs(60)),
-                        );
-                    }
+                UdpTrackerResolveResult::Two(v4, v6) => {
+                    let (r4, r6) = tokio::join!(
+                        self.tracker_one_request_udp(v4.into(), &client)
+                            .instrument(trace_span!("udp request", addr=?v4)),
+                        self.tracker_one_request_udp(v6.into(), &client)
+                            .instrument(trace_span!("udp request", addr=?v6))
+                    );
+                    sleep_interval = Some(
+                        r4.or(r6)
+                            .ok()
+                            .or(sleep_interval)
+                            .unwrap_or(Duration::from_secs(60)),
+                    )
                 }
             }
         }
     }
-}
 
-/// Builds an announce URL without discarding tracker-specific query data.
-///
-/// Some trackers use query flags to select an announce protocol variant. The
-/// BitTorrent announce parameters must therefore be appended to the original
-/// query instead of replacing it.
-fn announce_url(tracker_url: &Url, request_query: &str) -> Url {
-    let mut announce_url = tracker_url.clone();
-    let query = match tracker_url.query() {
-        Some(existing_query) if !existing_query.is_empty() => {
-            let mut query = String::with_capacity(existing_query.len() + request_query.len() + 1);
-            query.push_str(existing_query);
-            query.push('&');
-            query.push_str(request_query);
-            query
+    async fn tracker_one_request_udp(
+        &self,
+        addr: SocketAddr,
+        client: &UdpTrackerClient,
+    ) -> anyhow::Result<Duration> {
+        use tracker_comms_udp::*;
+
+        let stats = self.stats.get();
+        let request = AnnounceFields {
+            info_hash: self.info_hash,
+            peer_id: self.peer_id,
+            downloaded: stats.downloaded_bytes,
+            left: stats.get_left_to_download_bytes(),
+            uploaded: stats.uploaded_bytes,
+            event: match stats.torrent_state {
+                TrackerCommsStatsState::None => EVENT_NONE,
+                TrackerCommsStatsState::Initializing => EVENT_STARTED,
+                TrackerCommsStatsState::Paused => EVENT_STOPPED,
+                TrackerCommsStatsState::Live => {
+                    if stats.is_completed() {
+                        EVENT_COMPLETED
+                    } else {
+                        EVENT_STARTED
+                    }
+                }
+            },
+            key: self.key,
+            port: self.announce_port,
+        };
+
+        match client.announce(addr, request).await {
+            Ok(response) => {
+                trace!(len = response.addrs.len(), "received announce response");
+                for addr in response.addrs {
+                    self.tx.send(addr).await.context("rx closed")?;
+                }
+                let sleep = response.interval.max(5);
+                let sleep = Duration::from_secs(sleep as u64);
+                Ok(sleep)
+            }
+            Err(e) => {
+                debug!(?addr, "error reading announce response: {e:#}");
+                Err(e)
+            }
         }
-        _ => request_query.to_owned(),
-    };
-    announce_url.set_query(Some(&query));
-    announce_url
-}
-
-#[cfg(test)]
-mod announce_url_tests {
-    use super::announce_url;
-    use url::Url;
-
-    #[test]
-    fn preserves_bare_tracker_query_flag() {
-        let tracker = Url::parse("http://tracker.example/announce?magnet")
-            .expect("test tracker URL should be valid");
-
-        let result = announce_url(&tracker, "info_hash=abc&port=1234");
-
-        assert_eq!(result.query(), Some("magnet&info_hash=abc&port=1234"));
-    }
-
-    #[test]
-    fn preserves_tracker_query_parameters() {
-        let tracker = Url::parse("https://tracker.example/announce?token=secret&mode=compact")
-            .expect("test tracker URL should be valid");
-
-        let result = announce_url(&tracker, "info_hash=abc");
-
-        assert_eq!(
-            result.query(),
-            Some("token=secret&mode=compact&info_hash=abc")
-        );
-    }
-
-    #[test]
-    fn adds_announce_query_when_tracker_has_no_query() {
-        let tracker = Url::parse("udp://tracker.example:80/announce")
-            .expect("test tracker URL should be valid");
-
-        let result = announce_url(&tracker, "info_hash=abc");
-
-        assert_eq!(result.query(), Some("info_hash=abc"));
     }
 }

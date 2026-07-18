@@ -130,7 +130,7 @@ export interface MediaTrack {
   stream_url?: string;
 }
 
-export type PlaybackStage = "resolving_metadata" | "buffering" | "ready" | "failed";
+export type PlaybackStage = "resolving_metadata" | "validating_cache" | "buffering" | "ready" | "failed";
 
 export interface PlaybackStatus {
   preparation_id: string;
@@ -154,7 +154,8 @@ export interface PeerDiagnostics {
 }
 
 export interface PieceDiagnostics {
-  verified: number;
+  available: number;
+  downloaded_this_session: number;
   total: number;
   average_download_ms?: number;
 }
@@ -172,6 +173,7 @@ export interface TorrentDiagnostics {
   magnet_link?: string;
   trackers: string[];
   uploaded_bytes: number;
+  downloaded_this_session_bytes: number;
   upload_mib_per_second: number;
   peers: PeerDiagnostics;
   pieces: PieceDiagnostics;

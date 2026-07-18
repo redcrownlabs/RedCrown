@@ -24,6 +24,7 @@ export function formatDownloadSpeed(mebibytesPerSecond: number) {
 export function playbackStageLabel(stage: PlaybackStage) {
   switch (stage) {
     case "resolving_metadata": return "Downloading torrent metadata…";
+    case "validating_cache": return "Checking cached stream data…";
     case "buffering": return "Downloading stream data…";
     case "ready": return "Ready to play";
     case "failed": return "Couldn’t prepare playback";

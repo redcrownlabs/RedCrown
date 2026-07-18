@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { formatBytes, formatDownloadSpeed, playbackPercent } from "./playback-model";
+import { formatBytes, formatDownloadSpeed, playbackPercent, playbackStageLabel } from "./playback-model";
 
 describe("playback progress formatting", () => {
   it("bounds transfer percentages", () => {
@@ -14,5 +14,10 @@ describe("playback progress formatting", () => {
     expect(formatBytes(2_058_991_637)).toBe("1.9 GiB");
     expect(formatDownloadSpeed(0.5)).toBe("512 KiB/s");
     expect(formatDownloadSpeed(2.25)).toBe("2.3 MiB/s");
+  });
+
+  it("identifies cache validation separately from network buffering", () => {
+    expect(playbackStageLabel("validating_cache")).toBe("Checking cached stream data…");
+    expect(playbackStageLabel("buffering")).toBe("Downloading stream data…");
   });
 });

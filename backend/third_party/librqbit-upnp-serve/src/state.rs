@@ -1,7 +1,7 @@
 use std::{
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -10,9 +10,9 @@ use anyhow::Context;
 use axum::body::Bytes;
 use librqbit_core::spawn_utils::spawn_with_cancel;
 use tokio_util::sync::CancellationToken;
-use tracing::{error_span, Span};
+use tracing::{Span, debug_span};
 
-use crate::{subscriptions::Subscriptions, ContentDirectoryBrowseProvider};
+use crate::{ContentDirectoryBrowseProvider, subscriptions::Subscriptions};
 
 pub struct UpnpServerStateInner {
     pub(crate) rendered_root_description: Bytes,
@@ -40,7 +40,7 @@ impl UpnpServerStateInner {
         let cancel_token = cancellation_token.child_token();
         let drop_guard = cancel_token.clone().drop_guard();
         let (btx, _) = tokio::sync::broadcast::channel(32);
-        let span = error_span!(parent: None, "upnp-server");
+        let span = debug_span!(parent: None, "upnp-server");
         let state = Arc::new(Self {
             rendered_root_description,
             provider,
@@ -53,8 +53,9 @@ impl UpnpServerStateInner {
             cancel_token: cancel_token.clone(),
         });
 
-        spawn_with_cancel(
-            error_span!(parent: span, "system_update_id_updater"),
+        spawn_with_cancel::<anyhow::Error>(
+            debug_span!(parent: span, "system_update_id_updater"),
+            "system_update_id_updater",
             cancel_token,
             {
                 let state = Arc::downgrade(&state);

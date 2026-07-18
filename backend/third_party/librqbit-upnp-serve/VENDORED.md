@@ -1,15 +1,23 @@
-# Vendored `librqbit-upnp-serve`
+# Vendored librqbit UPnP server
 
-This directory contains the source of `librqbit-upnp-serve` 1.0.1 from the
-Apache-2.0 licensed [rqbit project](https://github.com/ikatson/rqbit).
+Upstream: `https://github.com/ikatson/rqbit`
 
-RedCrown vendors this crate because the published release constrains
-`quick-xml` to the vulnerable 0.37 series (RUSTSEC-2026-0194 and
-RUSTSEC-2026-0195). The only intentional dependency change is allowing the
-compatible 0.41 series. The implementation remains upstream source.
+Upstream crate: `librqbit-upnp-serve` 9.0.0-rc.0
 
-The invariant is that the UPnP media-server behavior and public API remain
-identical to upstream 1.0.1 while RedCrown's resolved runtime graph contains no
-known vulnerable `quick-xml` release. This small maintenance fork is preferred
-to suppressing security advisories; it can be removed after an upstream release
-adopts a fixed parser version.
+Upstream commit: `1fd0818e6efc1b48fd15b07fbc09ac8ad6e524cf`
+
+## Why this fork exists
+
+This optional media-server adapter is pinned with the qualified rqbit 9 engine
+so the vendored workspace remains internally coherent. Its XML parser no longer
+uses the vulnerable 0.37 dependency series.
+
+## Maintenance invariant
+
+Keep this crate aligned with the pinned 9.0.0-rc.0 package. Do not add RedCrown
+application behavior here.
+
+## Tradeoff
+
+RedCrown owns security review for the pinned release candidate until a stable,
+qualified rqbit release provides the same transport behavior.

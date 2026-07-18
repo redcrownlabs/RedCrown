@@ -10,9 +10,9 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-edition = "2018"
+edition = "2024"
 name = "librqbit-tracker-comms"
-version = "3.0.0"
+version = "9.0.0-rc.0"
 build = false
 autolib = false
 autobins = false
@@ -28,17 +28,6 @@ keywords = ["bittorrent", "torrent"]
 categories = ["network-programming"]
 resolver = "2"
 
-[features]
-default = ["sha1-crypto-hash"]
-sha1-crypto-hash = [
-    "bencode/sha1-crypto-hash",
-    "librqbit-core/sha1-crypto-hash",
-]
-sha1-ring = [
-    "bencode/sha1-ring",
-    "librqbit-core/sha1-ring",
-]
-
 [lib]
 name = "librqbit_tracker_comms"
 path = "src/lib.rs"
@@ -47,29 +36,38 @@ path = "src/lib.rs"
 version = "1"
 
 [dependencies.async-stream]
-version = "0.3.5"
+version = "0.3"
+
+[dependencies.backon]
+version = "1.5"
 
 [dependencies.bencode]
-version = "3.1"
+version = "9.0.0-rc.0"
 default-features = false
 package = "librqbit-bencode"
 
 [dependencies.buffers]
-version = "4.2"
+version = "9.0.0-rc.0"
 package = "librqbit-buffers"
 
 [dependencies.byteorder]
-version = "1.5"
+version = "1"
 
 [dependencies.futures]
 version = "0.3"
 
+[dependencies.itertools]
+version = "0.14"
+
 [dependencies.librqbit-core]
-version = "5"
+version = "9.0.0-rc.0"
 default-features = false
 
+[dependencies.librqbit-dualstack-sockets]
+version = "0.7"
+
 [dependencies.parking_lot]
-version = "0.12.3"
+version = "0.12"
 
 [dependencies.rand]
 version = "0.9"
@@ -81,16 +79,21 @@ default-features = false
 
 [dependencies.serde]
 version = "1"
-features = ["derive"]
+
+[dependencies.serde_derive]
+version = "1"
+
+[dependencies.serde_with]
+version = "3"
 
 [dependencies.tokio]
 version = "1"
 
 [dependencies.tokio-util]
-version = "0.7.13"
+version = "0.7"
 
 [dependencies.tracing]
-version = "0.1.40"
+version = "0.1"
 
 [dependencies.url]
 version = "2"

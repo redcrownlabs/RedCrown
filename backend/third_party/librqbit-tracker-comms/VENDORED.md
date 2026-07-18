@@ -2,9 +2,9 @@
 
 Upstream: `https://github.com/ikatson/rqbit`
 
-Upstream crate: `librqbit-tracker-comms` 3.0.0
+Upstream crate: `librqbit-tracker-comms` 9.0.0-rc.0
 
-Upstream commit: `559fca8552f64099b39c9284c52fd4d3d9a9169f`
+Upstream commit: `1fd0818e6efc1b48fd15b07fbc09ac8ad6e524cf`
 
 ## Why this fork exists
 
@@ -13,21 +13,20 @@ announce parameters. Trackers such as Rutracker use a bare `magnet` query flag
 to select the magnet announce endpoint. Dropping that flag returns no usable
 peers and prevents magnet metadata discovery.
 
-Version 3.0.0 also requires the optional `complete` and `incomplete` swarm
+Older versions also required the optional `complete` and `incomplete` swarm
 counts. Rutracker's magnet endpoint returns the required interval and peers but
 omits those advisory counts. RedCrown defaults missing counts to zero, matching
 upstream 9.0 and the permissive tracker response contract.
 
-RedCrown preserves the original query and appends the announce parameters. The
-focused tests in `src/tracker_comms.rs` lock in this behavior. Upstream's 9.0
-release candidate contains the same semantic correction, but RedCrown does not
-adopt release-candidate torrent engines in its stable dependency set.
+Version 9.0 preserves the original query and accepts missing advisory swarm
+counts. The focused tests in `src/tracker_comms.rs` lock in this behavior.
 
 ## Maintenance invariant
 
-Keep this fork byte-for-byte aligned with upstream 3.0.0 except for documented
-changes. Remove the patch when a stable, qualified librqbit release preserves
-tracker URL query data. Do not add RedCrown-specific behavior here.
+Keep this fork byte-for-byte aligned with the pinned 9.0.0-rc.0 package except
+for documented changes. Remove the patch when a stable, qualified librqbit
+release preserves the same contract. Do not add RedCrown-specific behavior
+here.
 
 ## Tradeoff
 

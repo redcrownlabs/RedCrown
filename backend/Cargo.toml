@@ -7,6 +7,7 @@ members = [
     "crates/redcrown-diagnostics",
     "crates/redcrown-desktop",
     "third_party/librqbit",
+    "third_party/librqbit-dualstack-sockets",
     "third_party/librqbit-tracker-comms",
     "third_party/librqbit-upnp",
     "third_party/librqbit-upnp-serve",
@@ -14,11 +15,12 @@ members = [
 resolver = "2"
 
 [patch.crates-io]
-# librqbit 8.1.1 discards tracker URL query parameters. The documented,
-# regression-tested backport is maintained under third_party until a stable
-# upstream librqbit release includes the fix.
+# RedCrown vendors the reviewed rqbit 9.0 release candidate because it is the
+# first upstream engine line with dual TCP/uTP peer transport. The fork and its
+# qualification requirements are documented in third_party/librqbit/VENDORED.md.
 librqbit-tracker-comms = { path = "third_party/librqbit-tracker-comms" }
 librqbit = { path = "third_party/librqbit" }
+librqbit-dualstack-sockets = { path = "third_party/librqbit-dualstack-sockets" }
 librqbit-upnp = { path = "third_party/librqbit-upnp" }
 librqbit-upnp-serve = { path = "third_party/librqbit-upnp-serve" }
 
@@ -35,7 +37,7 @@ axum = "0.8"
 backtrace = "0.3"
 http = "1.3"
 directories = "6.0"
-librqbit = { version = "=8.1.1", default-features = false, features = ["default-tls"] }
+librqbit = { version = "=9.0.0-rc.0", default-features = false, features = ["default-tls"] }
 mimalloc = "0.1"
 opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }

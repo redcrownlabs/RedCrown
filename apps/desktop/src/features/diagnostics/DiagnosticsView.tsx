@@ -4,6 +4,7 @@ import type { TorrentDiagnostics } from "../../shared/contract.generated";
 import { formatBytes, formatDownloadSpeed, playbackPercent, playbackStageLabel } from "../playback/playback-model";
 import { invoke, messageOf } from "../../shared/ipc";
 import { Icon } from "../../shared/ui/Icon";
+import { startDiagnosticsPolling } from "./diagnostics-model";
 
 export function DiagnosticsView({
   preparationId,
@@ -18,27 +19,14 @@ export function DiagnosticsView({
 
   useEffect(() => {
     if (!preparationId) return;
-    let active = true;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    async function poll() {
-      try {
-        const next = await invoke<TorrentDiagnostics>("playback.diagnostics", {
+    return startDiagnosticsPolling(
+      () => invoke<TorrentDiagnostics>("playback.diagnostics", {
           preparation_id: preparationId,
-        });
-        if (!active) return;
-        setDiagnostics(next);
-        setDiagnosticError(undefined);
-        timer = setTimeout(() => void poll(), 1000);
-      } catch (reason) {
-        if (!active) return;
-        setDiagnosticError(messageOf(reason));
-      }
-    }
-    void poll();
-    return () => {
-      active = false;
-      if (timer) clearTimeout(timer);
-    };
+      }),
+      setDiagnostics,
+      setDiagnosticError,
+      messageOf,
+    );
   }, [preparationId]);
 
   async function copyMagnetLink() {
@@ -72,7 +60,7 @@ export function DiagnosticsView({
     ? playbackPercent(playback.downloaded_bytes, playback.total_bytes)
     : 0;
   const piecePercent = diagnostics && diagnostics.pieces.total > 0
-    ? Math.min(100, diagnostics.pieces.verified / diagnostics.pieces.total * 100)
+    ? Math.min(100, diagnostics.pieces.available / diagnostics.pieces.total * 100)
     : 0;
 
   return (
@@ -99,10 +87,11 @@ export function DiagnosticsView({
             <div className="diagnostics-progress" aria-hidden="true"><span style={{ width: `${percent}%` }} /></div>
             <strong className="diagnostics-progress-copy">{percent.toFixed(1)}%</strong>
             <dl className="diagnostics-stats">
-              <DiagnosticStat label="Downloaded" value={`${formatBytes(diagnostics.playback.downloaded_bytes)} / ${formatBytes(diagnostics.playback.total_bytes)}`} />
-              <DiagnosticStat label="Download" value={formatDownloadSpeed(diagnostics.playback.download_mib_per_second)} />
-              <DiagnosticStat label="Uploaded" value={formatBytes(diagnostics.uploaded_bytes)} />
-              <DiagnosticStat label="Upload" value={formatDownloadSpeed(diagnostics.upload_mib_per_second)} />
+              <DiagnosticStat label="Available locally" value={`${formatBytes(diagnostics.playback.downloaded_bytes)} / ${formatBytes(diagnostics.playback.total_bytes)}`} />
+              <DiagnosticStat label="Downloaded this session" value={formatBytes(diagnostics.downloaded_this_session_bytes)} />
+              <DiagnosticStat label="Download now" value={formatDownloadSpeed(diagnostics.playback.download_mib_per_second)} />
+              <DiagnosticStat label="Uploaded this session" value={formatBytes(diagnostics.uploaded_bytes)} />
+              <DiagnosticStat label="Upload now" value={formatDownloadSpeed(diagnostics.upload_mib_per_second)} />
             </dl>
             {diagnostics.playback.error && <p className="diagnostics-error" role="alert">{diagnostics.playback.error}</p>}
           </section>
@@ -123,7 +112,8 @@ export function DiagnosticsView({
             <div className="diagnostics-card-heading"><h2>Pieces</h2><span>{piecePercent.toFixed(1)}%</span></div>
             <div className="diagnostics-progress piece-progress" aria-hidden="true"><span style={{ width: `${piecePercent}%` }} /></div>
             <dl className="diagnostics-stats diagnostics-stats-compact">
-              <DiagnosticStat label="Verified" value={diagnostics.pieces.verified} />
+              <DiagnosticStat label="Available" value={diagnostics.pieces.available} />
+              <DiagnosticStat label="Downloaded this session" value={diagnostics.pieces.downloaded_this_session} />
               <DiagnosticStat label="Total" value={diagnostics.pieces.total || "Resolving"} />
               <DiagnosticStat label="Average piece" value={diagnostics.pieces.average_download_ms != null ? `${diagnostics.pieces.average_download_ms} ms` : "Waiting"} />
             </dl>

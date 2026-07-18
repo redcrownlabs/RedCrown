@@ -1,5 +1,5 @@
 use anyhow::Context;
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use serde::Deserialize;
 
 use crate::{
@@ -35,7 +35,7 @@ async fn check_response(r: reqwest::Response) -> anyhow::Result<reqwest::Respons
         .and_then(|e| e.human_readable);
     let body_display = human_readable_internal_error.unwrap_or(&body);
 
-    anyhow::bail!("{} -> {}: {}", url, status, body_display)
+    anyhow::bail!("{url} -> {status}: {body_display}")
 }
 
 #[derive(Deserialize)]

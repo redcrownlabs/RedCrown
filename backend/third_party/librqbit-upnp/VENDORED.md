@@ -2,31 +2,23 @@
 
 Upstream: `https://github.com/ikatson/rqbit`
 
-Upstream crate: `librqbit-upnp` 1.0.0
+Upstream crate: `librqbit-upnp` 9.0.0-rc.0
 
-Upstream source release: `librqbit-upnp-1.0.0` from crates.io
+Upstream commit: `1fd0818e6efc1b48fd15b07fbc09ac8ad6e524cf`
 
 ## Why this fork exists
 
-The stable upstream crate requires `quick-xml` 0.37, which is affected by
-RUSTSEC-2026-0194 and RUSTSEC-2026-0195. Both advisories can be triggered while
-parsing untrusted XML. UPnP device descriptions are network-provided input, so
-RedCrown cannot treat the vulnerable parser as unreachable.
-
-The only newer published `librqbit-upnp` version is coupled to the rqbit 9.0
-release candidate. RedCrown keeps the qualified stable torrent engine and
-updates this small crate to `quick-xml` 0.41, whose deserialization API remains
-compatible with the single `quick_xml::de::from_str` call used here.
+This crate is pinned with the qualified rqbit 9 engine so UPnP types and the
+shared dual-stack socket dependency remain coherent. Its `quick-xml` 0.38.4
+dependency is outside the vulnerable 0.37 series previously removed by
+RedCrown.
 
 ## Maintenance invariant
 
-Keep this fork aligned with upstream 1.0.0 except for the documented dependency
-upgrade. Remove it when a stable, qualified `librqbit-upnp` release uses a
-non-vulnerable XML parser. Do not add RedCrown application behavior to this
-crate.
+Keep this crate aligned with the pinned 9.0.0-rc.0 package. Do not add RedCrown
+application behavior here.
 
 ## Tradeoff
 
-RedCrown temporarily owns security updates for this fork. This is preferable to
-suppressing exploitable advisories, disabling inbound port mapping, or adopting
-an otherwise unqualified release-candidate torrent engine.
+RedCrown owns security review for the pinned release candidate until a stable,
+qualified rqbit release provides the same transport behavior.

@@ -8,23 +8,23 @@ pub mod utils;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Weak;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use anyhow::bail;
 use anyhow::Context;
+use anyhow::bail;
 use arc_swap::ArcSwapOption;
 use buffers::ByteBufOwned;
 use bytes::Bytes;
-use futures::future::BoxFuture;
 use futures::FutureExt;
+use futures::future::BoxFuture;
 use librqbit_core::hash_id::Id20;
 use librqbit_core::lengths::Lengths;
 
 use librqbit_core::spawn_utils::spawn_with_cancel;
-use librqbit_core::torrent_metainfo::TorrentMetaV1Info;
+use librqbit_core::torrent_metainfo::ValidatedTorrentMetaV1Info;
 pub use live::*;
 use parking_lot::RwLock;
 
@@ -33,10 +33,11 @@ use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
-use tracing::error_span;
+use tracing::debug_span;
 use tracing::trace;
 use tracing::warn;
 
+use crate::Session;
 use crate::chunk_tracker::ChunkTracker;
 use crate::file_info::FileInfo;
 use crate::limits::LimitsConfig;
@@ -45,10 +46,8 @@ use crate::spawn_utils::BlockingSpawner;
 use crate::storage::BoxStorageFactory;
 use crate::stream_connect::StreamConnector;
 use crate::torrent_state::stats::LiveStats;
-use crate::type_aliases::DiskWorkQueueSender;
 use crate::type_aliases::FileInfos;
 use crate::type_aliases::PeerStream;
-use crate::Session;
 
 use initializing::TorrentStateInitializing;
 
@@ -115,9 +114,9 @@ pub(crate) struct ManagedTorrentOptions {
     pub peer_read_write_timeout: Option<Duration>,
     pub allow_overwrite: bool,
     pub output_folder: PathBuf,
-    pub disk_write_queue: Option<DiskWorkQueueSender>,
     pub ratelimits: LimitsConfig,
     pub initial_peers: Vec<SocketAddr>,
+    pub peer_limit: Option<usize>,
     #[cfg(feature = "disable-upload")]
     pub _disable_upload: bool,
 }
@@ -136,26 +135,23 @@ impl ManagedTorrentOptions {
 
 // Torrent bencodee "info" + some precomputed fields based on it for frequent access.
 pub struct TorrentMetadata {
-    pub info: TorrentMetaV1Info<ByteBufOwned>,
+    pub info: ValidatedTorrentMetaV1Info<ByteBufOwned>,
     pub torrent_bytes: Bytes,
     pub info_bytes: Bytes,
-    pub lengths: Lengths,
     pub file_infos: FileInfos,
-    pub name: Option<String>,
 }
 
 impl TorrentMetadata {
     pub(crate) fn new(
-        info: TorrentMetaV1Info<ByteBufOwned>,
+        info: ValidatedTorrentMetaV1Info<ByteBufOwned>,
         torrent_bytes: Bytes,
         info_bytes: Bytes,
     ) -> anyhow::Result<Self> {
-        let lengths = Lengths::from_torrent(&info)?;
         let file_infos = info
-            .iter_file_details_ext(&lengths)?
+            .iter_file_details_ext()
             .map(|fd| {
                 Ok::<_, anyhow::Error>(FileInfo {
-                    relative_filename: fd.details.filename.to_pathbuf()?,
+                    relative_filename: fd.details.filename.to_pathbuf(),
                     offset_in_torrent: fd.offset,
                     piece_range: fd.pieces,
                     len: fd.details.len,
@@ -163,19 +159,17 @@ impl TorrentMetadata {
                 })
             })
             .collect::<anyhow::Result<Vec<FileInfo>>>()?;
-        let name = info
-            .name
-            .as_ref()
-            .and_then(|n| std::str::from_utf8(n.as_ref()).ok())
-            .map(|s| s.to_owned());
+
         Ok(Self {
             info,
             torrent_bytes,
             info_bytes,
-            lengths,
             file_infos,
-            name,
         })
+    }
+
+    pub fn lengths(&self) -> &Lengths {
+        self.info.lengths()
     }
 }
 
@@ -198,6 +192,14 @@ pub struct ManagedTorrentShared {
 
     // "dn" from magnet link
     pub(crate) magnet_name: Option<String>,
+
+    pub(crate) client_name_and_version: String,
+}
+
+impl ManagedTorrentShared {
+    pub(crate) fn client_name_and_version(&self) -> &str {
+        &self.client_name_and_version
+    }
 }
 
 pub struct ManagedTorrent {
@@ -216,7 +218,11 @@ impl ManagedTorrent {
 
     pub fn name(&self) -> Option<String> {
         if let Some(m) = &*self.metadata.load() {
-            return m.name.clone().or_else(|| self.shared.magnet_name.clone());
+            return m
+                .info
+                .name()
+                .map(|n| n.into_owned())
+                .or_else(|| self.shared.magnet_name.clone());
         }
         self.shared.magnet_name.clone()
     }
@@ -274,6 +280,18 @@ impl ManagedTorrent {
         }
     }
 
+    // Get live torrent but wait a bit until it's initialized if it is
+    pub(crate) async fn live_wait_initializing(
+        &self,
+        duration: Duration,
+    ) -> Option<Arc<TorrentStateLive>> {
+        timeout(duration, self.wait_until_initialized())
+            .await
+            .ok()?
+            .ok()?;
+        self.live()
+    }
+
     fn stop_with_error(&self, error: anyhow::Error) {
         let mut g = self.locked.write();
 
@@ -281,16 +299,25 @@ impl ManagedTorrent {
             ManagedTorrentState::Live(live) => {
                 if let Err(err) = live.pause() {
                     warn!(
-                        "error pausing live torrent during fatal error handling: {:?}",
-                        err
+                        id = self.shared.id,
+                        info_hash = ?self.shared.info_hash,
+                        "error pausing live torrent during fatal error handling: {err:#}",
                     );
                 }
             }
             ManagedTorrentState::Error(e) => {
-                warn!("bug: torrent already was in error state when trying to stop it. Previous error was: {:?}", e);
+                warn!(
+                    id = self.shared.id,
+                    info_hash = ?self.shared.info_hash,
+                    "bug: torrent already was in error state when trying to stop it. Previous error was: {e:#}",
+                );
             }
             ManagedTorrentState::None => {
-                warn!("bug: torrent encountered in None state during fatal error handling")
+                warn!(
+                    id = self.shared.id,
+                    info_hash = ?self.shared.info_hash,
+                    "bug: torrent encountered in None state during fatal error handling"
+                )
             }
             _ => {}
         };
@@ -328,7 +355,8 @@ impl ManagedTorrent {
                     let token = token.clone();
 
                     spawn_with_cancel(
-                        error_span!(parent: span.clone(), "initialize_and_start"),
+                        debug_span!(parent: span.clone(), "initialize_and_start"),
+                        "initialize_and_start",
                         token.clone(),
                         async move {
                             let concurrent_init_semaphore =
@@ -343,7 +371,9 @@ impl ManagedTorrent {
                                     let mut g = t.locked.write();
                                     if let ManagedTorrentState::Initializing(_) = &g.state {
                                     } else {
-                                        debug!("no need to start torrent anymore, as it switched state from initilizing");
+                                        debug!(
+                                            "no need to start torrent anymore, as it switched state from initializing"
+                                        );
                                         return Ok(());
                                     }
 
@@ -352,7 +382,7 @@ impl ManagedTorrent {
                                     _start(&t, peer_rx, start_paused, session, Some(g), token)
                                 }
                                 Err(err) => {
-                                    let result = anyhow::anyhow!("{:?}", err);
+                                    let result = anyhow::anyhow!("{err:?}");
                                     t.locked.write().state = ManagedTorrentState::Error(err);
                                     t.state_change_notify.notify_waiters();
                                     Err(result)
@@ -454,7 +484,7 @@ impl ManagedTorrent {
                 .metadata
                 .load()
                 .as_ref()
-                .map(|r| r.lengths.total_length())
+                .map(|r| r.info.lengths().total_length())
                 .unwrap_or_default(),
             file_progress: Vec::new(),
             state: S::Error,
@@ -497,7 +527,7 @@ impl ManagedTorrent {
                 }
                 ManagedTorrentState::Error(e) => {
                     resp.state = S::Error;
-                    resp.error = Some(format!("{:?}", e))
+                    resp.error = Some(format!("{e:?}"))
                 }
                 ManagedTorrentState::None => {
                     resp.state = S::Error;
@@ -515,14 +545,18 @@ impl ManagedTorrent {
             loop {
                 let done = self.with_state(|s| match s {
                     ManagedTorrentState::Initializing(_) => Ok(false),
-                    ManagedTorrentState::Error(e) => bail!("{:?}", e),
+                    ManagedTorrentState::Error(e) => bail!("{e:?}"),
                     ManagedTorrentState::None => bail!("bug: torrent state is None"),
                     _ => Ok(true),
                 })?;
                 if done {
                     return Ok(());
                 }
-                let _ = timeout(Duration::from_secs(1), self.state_change_notify.notified()).await;
+                let _ = timeout(
+                    Duration::from_millis(100),
+                    self.state_change_notify.notified(),
+                )
+                .await;
             }
         }
         .boxed()
@@ -538,7 +572,7 @@ impl ManagedTorrent {
                         Ok(None)
                     }
                     ManagedTorrentState::Live(l) => Ok(Some(l.clone())),
-                    ManagedTorrentState::Error(e) => bail!("{:?}", e),
+                    ManagedTorrentState::Error(e) => bail!("{e:?}"),
                     ManagedTorrentState::None => bail!("bug: torrent state is None"),
                 })?;
                 if let Some(live) = live {
@@ -595,9 +629,12 @@ fn spawn_fatal_errors_receiver(
     token: CancellationToken,
 ) {
     let span = state.shared.span.clone();
+    let id = state.shared.id;
+    let info_hash = state.shared.info_hash;
     let state = Arc::downgrade(state);
-    spawn_with_cancel(
-        error_span!(parent: span, "fatal_errors_receiver"),
+    spawn_with_cancel::<&'static str>(
+        debug_span!(parent: span, "fatal_errors_receiver"),
+        "fatal_errors_receiver",
         token,
         async move {
             let e = match rx.await {
@@ -607,7 +644,11 @@ fn spawn_fatal_errors_receiver(
             if let Some(state) = state.upgrade() {
                 state.stop_with_error(e);
             } else {
-                warn!("tried to stop the torrent with error, but couldn't upgrade the arc");
+                warn!(
+                    ?id,
+                    ?info_hash,
+                    "tried to stop the torrent with error, but couldn't upgrade the arc"
+                );
             }
             Ok(())
         },
@@ -616,7 +657,8 @@ fn spawn_fatal_errors_receiver(
 
 fn spawn_peer_adder(live: &Arc<TorrentStateLive>, mut peer_rx: PeerStream) {
     live.spawn(
-        error_span!(parent: live.torrent().span.clone(), "external_peer_adder"),
+        debug_span!(parent: live.torrent().span.clone(), "external_peer_adder"),
+        format!("[{}]external_peer_adder", live.shared.id),
         {
             let live = live.clone();
             async move {
@@ -629,12 +671,12 @@ fn spawn_peer_adder(live: &Arc<TorrentStateLive>, mut peer_rx: PeerStream) {
                 loop {
                     match timeout(Duration::from_secs(5), peer_rx.next()).await {
                         Ok(Some(peer)) => {
-                            trace!(?peer, "received peer from peer_rx");
+                            trace!(?peer, "received peer");
                             let live = match live.upgrade() {
                                 Some(live) => live,
                                 None => return Ok(()),
                             };
-                            live.add_peer_if_not_seen(peer).context("torrent closed")?;
+                            live.add_peer_if_not_seen(peer)?;
                         }
                         Ok(None) => {
                             debug!("peer_rx closed, closing peer adder");
