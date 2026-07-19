@@ -60,7 +60,7 @@ version = "0.7"
 version = "2"
 
 [dependencies.quick-xml]
-version = "0.38"
+version = "0.41"
 features = ["serialize"]
 
 [dependencies.reqwest]
@@ -97,3 +97,4 @@ features = [
 [dev-dependencies.tracing-subscriber]
 version = "0.3"
 default-features = false
+features = ["fmt"]

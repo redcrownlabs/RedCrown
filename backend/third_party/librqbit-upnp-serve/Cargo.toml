@@ -79,7 +79,7 @@ version = "2"
 version = "0.12"
 
 [dependencies.quick-xml]
-version = "0.38"
+version = "0.41"
 features = ["serialize"]
 
 [dependencies.rand]
@@ -120,3 +120,4 @@ features = ["trace"]
 [dev-dependencies.tracing-subscriber]
 version = "0.3"
 default-features = false
+features = ["fmt"]

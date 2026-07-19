@@ -52,6 +52,18 @@ application must distinguish cached availability from pieces downloaded during
 the current engine session; combining those counters produces impossible-looking
 diagnostics when an expiring stream-cache entry is reused.
 
+The vendored UPnP crates require `quick-xml` 0.41 or newer. Earlier qualified
+manifests resolved 0.38.4, which is affected by RUSTSEC-2026-0194 and
+RUSTSEC-2026-0195 when parsing attacker-controlled XML. UPnP responses are
+network input, so RedCrown preserves the patched parser floor rather than
+allowing the upstream release-candidate manifest to restore the vulnerable
+range. The UPnP parsing tests and full dependency audit are release gates.
+
+The UPnP crates' development-only `tracing-subscriber` dependency explicitly
+enables `fmt` because their example targets call that API. This keeps complete
+package tests meaningful; narrowing tests to avoid compiling the examples would
+hide an invalid vendored manifest.
+
 RedCrown also separates fast-resume bitfields from persistent torrent
 membership. `SessionOptions::fastresume_root` stores only verified-piece state
 below `<root>/<info-hash>/`; it is mutually exclusive with session persistence.
