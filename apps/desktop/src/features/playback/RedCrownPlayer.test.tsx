@@ -60,9 +60,11 @@ describe("RedCrownPlayer keyboard shortcuts", () => {
   afterEach(() => {
     act(() => root.unmount());
     container.remove();
+    vi.useRealTimers();
   });
 
   it("seeks from a document-level arrow key even when the stage is not focused", () => {
+    vi.useFakeTimers();
     const video = container.querySelector("video");
     expect(video).not.toBeNull();
 
@@ -71,9 +73,48 @@ describe("RedCrownPlayer keyboard shortcuts", () => {
         key: "ArrowRight",
         bubbles: true,
       }));
+      vi.advanceTimersByTime(120);
     });
 
     expect(video?.src).toContain("start=10.000");
+    vi.useRealTimers();
+  });
+
+  it("coalesces repeated keyboard seeks into one stream restart", () => {
+    vi.useFakeTimers();
+    const video = container.querySelector("video");
+
+    act(() => {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+      vi.advanceTimersByTime(120);
+    });
+
+    expect(video?.src).toContain("start=20.000");
+    vi.useRealTimers();
+  });
+
+  it("seeks inside buffered media without restarting the bridge", () => {
+    vi.useFakeTimers();
+    const video = container.querySelector("video");
+    expect(video).not.toBeNull();
+    Object.defineProperty(video, "buffered", {
+      configurable: true,
+      value: {
+        length: 1,
+        start: () => 0,
+        end: () => 30,
+      },
+    });
+
+    act(() => {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+      vi.advanceTimersByTime(120);
+    });
+
+    expect(video?.src).not.toContain("start=");
+    expect(video?.currentTime).toBe(10);
+    vi.useRealTimers();
   });
 
   it("mutes after a player button retained focus", () => {

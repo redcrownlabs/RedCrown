@@ -64,6 +64,8 @@ const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const METADATA_READ_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Media inspection must fail instead of hanging playback indefinitely.
 const MEDIA_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Encoder qualification must not delay application startup indefinitely.
+const MEDIA_ENCODER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// `FFmpeg` stderr is bounded before it enters structured diagnostics.
 const MAX_MEDIA_ERROR_BYTES: u64 = 64 * 1024;
 /// A one-mebibyte pipe decouples `FFmpeg` bursts from Chromium reads.
@@ -81,6 +83,10 @@ const MIN_H264_TRANSCODE_BITRATE: u64 = 2_000_000;
 const MAX_H264_TRANSCODE_BITRATE: u64 = 40_000_000;
 /// A short GOP keeps fragmented playback responsive without excessive keyframes.
 const H264_TRANSCODE_GOP_FRAMES: &str = "60";
+/// A short unthrottled prefix gets playable fragments to Chromium after a seek.
+const MEDIA_INITIAL_BURST_SECONDS: &str = "5";
+/// Media Foundation quality 75 balances interactive latency and visible fidelity.
+const MEDIA_FOUNDATION_QUALITY: &str = "75";
 /// PQ HDR is normalized and tone-mapped into Chromium-compatible BT.709 SDR.
 const PQ_TO_SDR_FILTER: &str = "zscale=primariesin=bt2020:transferin=smpte2084:matrixin=bt2020nc:rangein=limited:transfer=linear:npl=100,format=gbrpf32le,tonemap=mobius:desat=0,zscale=primaries=bt709:transfer=bt709:matrix=bt709:range=limited,format=yuv420p";
 /// HLG HDR uses the same output policy with its distinct source transfer function.
@@ -296,6 +302,7 @@ struct StreamState {
     api: Api,
     token: String,
     ffmpeg: PathBuf,
+    h264_encoder: H264Encoder,
     manifests: Arc<RwLock<HashMap<(usize, usize), MediaManifest>>>,
 }
 
@@ -322,6 +329,21 @@ enum VideoBridge {
 enum HdrTransfer {
     Hlg,
     Pq,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum H264Encoder {
+    MediaFoundation,
+    OpenH264,
+}
+
+impl H264Encoder {
+    fn name(self) -> &'static str {
+        match self {
+            Self::MediaFoundation => "h264_mf",
+            Self::OpenH264 => "libopenh264",
+        }
+    }
 }
 
 /// Owns the torrent session and loopback stream endpoint.
@@ -404,10 +426,12 @@ impl TorrentEngine {
         })?;
         let stream_token = Uuid::new_v4().simple().to_string();
         let media_manifests = Arc::new(RwLock::new(HashMap::new()));
+        let h264_encoder = select_h264_encoder(&media_tools.ffmpeg).await;
         let state = Arc::new(StreamState {
             api: Api::new(api.session().clone(), None),
             token: stream_token.clone(),
             ffmpeg: media_tools.ffmpeg.clone(),
+            h264_encoder,
             manifests: Arc::clone(&media_manifests),
         });
         let router = Router::new()
@@ -1579,6 +1603,7 @@ async fn build_playback_response(
         audio_track,
         start,
         manifest.video_bridge,
+        state.h264_encoder,
     );
     media_process_response(&state.ffmpeg, &arguments, "video/mp4")
 }
@@ -1588,6 +1613,7 @@ fn playback_arguments(
     audio_track: Option<usize>,
     start: f64,
     video_bridge: VideoBridge,
+    h264_encoder: H264Encoder,
 ) -> Vec<String> {
     let mut arguments = vec![
         "-nostdin".to_owned(),
@@ -1596,14 +1622,14 @@ fn playback_arguments(
         "error".to_owned(),
     ];
     if start > 0.0 {
-        if video_bridge == VideoBridge::CopyH264 {
-            arguments.push("-noaccurate_seek".to_owned());
-        }
+        arguments.push("-noaccurate_seek".to_owned());
         arguments.extend(["-ss".to_owned(), format!("{start:.3}")]);
     }
     arguments.extend([
         "-readrate".to_owned(),
         "1.1".to_owned(),
+        "-readrate_initial_burst".to_owned(),
+        MEDIA_INITIAL_BURST_SECONDS.to_owned(),
         "-i".to_owned(),
         native_url.to_owned(),
         "-map".to_owned(),
@@ -1620,16 +1646,12 @@ fn playback_arguments(
             bitrate,
             hdr_transfer,
         } => {
-            arguments.extend([
-                "-c:v".to_owned(),
-                "libopenh264".to_owned(),
-                "-profile:v".to_owned(),
-                "high".to_owned(),
-                "-rc_mode".to_owned(),
-                "quality".to_owned(),
-                "-b:v".to_owned(),
-                bitrate.to_string(),
-            ]);
+            let encoder = if hdr_transfer.is_some() {
+                H264Encoder::OpenH264
+            } else {
+                h264_encoder
+            };
+            push_h264_encoder_arguments(&mut arguments, encoder, bitrate);
             if let Some(transfer) = hdr_transfer {
                 arguments.extend(["-vf".to_owned(), hdr_to_sdr_filter(transfer).to_owned()]);
             }
@@ -1659,6 +1681,83 @@ fn playback_arguments(
         "pipe:1".to_owned(),
     ]);
     arguments
+}
+
+fn push_h264_encoder_arguments(arguments: &mut Vec<String>, encoder: H264Encoder, bitrate: u64) {
+    arguments.extend(["-c:v".to_owned(), encoder.name().to_owned()]);
+    match encoder {
+        H264Encoder::MediaFoundation => arguments.extend([
+            "-profile:v".to_owned(),
+            "100".to_owned(),
+            "-rate_control".to_owned(),
+            "quality".to_owned(),
+            "-quality".to_owned(),
+            MEDIA_FOUNDATION_QUALITY.to_owned(),
+            "-scenario".to_owned(),
+            "live_streaming".to_owned(),
+        ]),
+        H264Encoder::OpenH264 => arguments.extend([
+            "-profile:v".to_owned(),
+            "high".to_owned(),
+            "-rc_mode".to_owned(),
+            "quality".to_owned(),
+        ]),
+    }
+    arguments.extend(["-b:v".to_owned(), bitrate.to_string()]);
+}
+
+async fn select_h264_encoder(ffmpeg: &FsPath) -> H264Encoder {
+    if ffmpeg.as_os_str().is_empty() {
+        return H264Encoder::OpenH264;
+    }
+    let mut arguments = vec![
+        "-nostdin".to_owned(),
+        "-hide_banner".to_owned(),
+        "-loglevel".to_owned(),
+        "error".to_owned(),
+        "-f".to_owned(),
+        "lavfi".to_owned(),
+        "-i".to_owned(),
+        "color=size=128x72:rate=24".to_owned(),
+        "-frames:v".to_owned(),
+        "2".to_owned(),
+    ];
+    push_h264_encoder_arguments(
+        &mut arguments,
+        H264Encoder::MediaFoundation,
+        MIN_H264_TRANSCODE_BITRATE,
+    );
+    arguments.extend([
+        "-pix_fmt".to_owned(),
+        "yuv420p".to_owned(),
+        "-movflags".to_owned(),
+        "frag_keyframe+empty_moov+default_base_moof".to_owned(),
+        "-f".to_owned(),
+        "mp4".to_owned(),
+        "pipe:1".to_owned(),
+    ]);
+    let result = tokio::time::timeout(
+        MEDIA_ENCODER_PROBE_TIMEOUT,
+        Command::new(ffmpeg)
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await;
+    let encoder = match result {
+        Ok(Ok(status)) if status.success() => H264Encoder::MediaFoundation,
+        Ok(Ok(_) | Err(_)) | Err(_) => H264Encoder::OpenH264,
+    };
+    event!(
+        name: "media.encoder.selected",
+        Level::INFO,
+        media.encoder.name = encoder.name(),
+        "selected H.264 compatibility encoder"
+    );
+    encoder
 }
 
 async fn build_subtitle_response(
@@ -1906,10 +2005,10 @@ mod tests {
     use axum::http::HeaderValue;
 
     use super::{
-        DHT_STATE_FILENAME, HdrTransfer, ListenerMode, MAX_START_BUFFER_BYTES,
-        MIN_START_BUFFER_BYTES, TorrentFile, VideoBridge, h264_transcode_bitrate, magnet_link,
-        parse_probe_output, parse_range, playback_arguments, select_media_file,
-        select_video_bridge, session_options, start_buffer_target,
+        DHT_STATE_FILENAME, H264Encoder, HdrTransfer, ListenerMode, MAX_START_BUFFER_BYTES,
+        MEDIA_INITIAL_BURST_SECONDS, MIN_START_BUFFER_BYTES, TorrentFile, VideoBridge,
+        h264_transcode_bitrate, magnet_link, parse_probe_output, parse_range, playback_arguments,
+        select_media_file, select_video_bridge, session_options, start_buffer_target,
     };
 
     #[test]
@@ -2126,6 +2225,7 @@ mod tests {
             Some(2),
             13.5,
             VideoBridge::CopyH264,
+            H264Encoder::OpenH264,
         );
         let noaccurate_seek = arguments
             .iter()
@@ -2141,6 +2241,12 @@ mod tests {
             .expect("input option");
 
         assert!(noaccurate_seek < seek && seek < input);
+        assert!(arguments.windows(2).any(|pair| {
+            pair == [
+                "-readrate_initial_burst".to_owned(),
+                MEDIA_INITIAL_BURST_SECONDS.to_owned(),
+            ]
+        }));
         assert!(
             arguments
                 .windows(2)
@@ -2155,6 +2261,7 @@ mod tests {
             Some(2),
             0.0,
             VideoBridge::CopyH264,
+            H264Encoder::OpenH264,
         );
 
         assert!(!arguments.iter().any(|argument| argument == "-ss"));
@@ -2166,7 +2273,7 @@ mod tests {
     }
 
     #[test]
-    fn hevc_transcoding_uses_accurate_seek_and_the_bundled_cpu_encoder() {
+    fn hevc_transcoding_uses_keyframe_fast_seek_and_the_bundled_cpu_encoder() {
         let arguments = playback_arguments(
             "http://127.0.0.1/media",
             Some(2),
@@ -2175,10 +2282,11 @@ mod tests {
                 bitrate: 12_000_000,
                 hdr_transfer: Some(HdrTransfer::Pq),
             },
+            H264Encoder::OpenH264,
         );
 
         assert!(
-            !arguments
+            arguments
                 .iter()
                 .any(|argument| argument == "-noaccurate_seek")
         );
@@ -2196,6 +2304,62 @@ mod tests {
             arguments
                 .windows(2)
                 .any(|pair| { pair[0] == "-vf" && pair[1].contains("transferin=smpte2084") })
+        );
+    }
+
+    #[test]
+    fn media_foundation_encoder_uses_low_latency_quality_options() {
+        let arguments = playback_arguments(
+            "http://127.0.0.1/media",
+            Some(2),
+            13.5,
+            VideoBridge::TranscodeToH264 {
+                bitrate: 12_000_000,
+                hdr_transfer: None,
+            },
+            H264Encoder::MediaFoundation,
+        );
+
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["-c:v".to_owned(), "h264_mf".to_owned()])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["-profile:v".to_owned(), "100".to_owned()])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| { pair == ["-scenario".to_owned(), "live_streaming".to_owned()] })
+        );
+        assert!(!arguments.iter().any(|argument| argument == "-rc_mode"));
+    }
+
+    #[test]
+    fn hdr_transcoding_keeps_the_tone_map_compatible_encoder() {
+        let arguments = playback_arguments(
+            "http://127.0.0.1/media",
+            Some(2),
+            13.5,
+            VideoBridge::TranscodeToH264 {
+                bitrate: 12_000_000,
+                hdr_transfer: Some(HdrTransfer::Hlg),
+            },
+            H264Encoder::MediaFoundation,
+        );
+
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["-c:v".to_owned(), "libopenh264".to_owned()])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| { pair[0] == "-vf" && pair[1].contains("transferin=arib-std-b67") })
         );
     }
 }

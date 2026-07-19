@@ -84,24 +84,35 @@ hash check, preserving BitTorrent integrity.
 
 The loopback media bridge copies compatible H.264 video to keep startup and
 seeking responsive, while transcoding unsupported audio to AAC. HEVC video is
-converted to H.264 and can therefore use accurate input seeking. After a seek,
-every emitted track must retain the same relative source timeline. Accurate
-input seeking cannot satisfy that invariant when H.264 video is copied: FFmpeg
-keeps video from the preceding keyframe but discards the corresponding decoded
-audio pre-roll.
+converted to H.264. After a seek, every emitted track must retain the same
+relative source timeline. Accurate input seeking cannot satisfy that invariant
+when H.264 video is copied: FFmpeg keeps video from the preceding keyframe but
+discards the corresponding decoded audio pre-roll. It also makes HEVC seeks
+decode and discard the complete keyframe pre-roll before emitting anything,
+which produces multi-second stalls on CPU conversion.
 
-Seeked H.264-copy playback therefore places `-noaccurate_seek` before the input
-`-ss` and uses asynchronous audio resampling for small timestamp drift. Video
-and audio then begin at the same preceding keyframe boundary. The accepted
-tradeoff is that a copied-video seek may resume slightly before the requested
-time by at most one source GOP. HEVC playback already pays the conversion cost,
-so it retains accurate seeking instead.
+All seeked playback therefore places `-noaccurate_seek` before the input `-ss`
+and uses asynchronous audio resampling for small timestamp drift. Video and
+audio begin at the same preceding keyframe boundary without decoding discarded
+pre-roll. The accepted tradeoff is that a seek may resume slightly before the
+requested time by at most one source GOP.
+
+The bridge qualifies Windows Media Foundation with a bounded synthetic encode
+when the torrent engine starts. A successful probe selects `h264_mf` for lower
+interactive SDR HEVC conversion latency. HDR conversion retains
+`libopenh264`, whose software-frame input is compatible with the qualified
+tone-map filters. Missing media components, unsupported platforms, probe
+errors, and probe timeouts also retain that bundled fallback. Playback allows
+a five-second input burst before returning to its 1.1x rate limit, providing
+an initial playable fragment without permitting the bridge to race through the
+complete source.
 
 The media bridge integration test uses a deterministic long-GOP video with
 E-AC-3 audio, seeks between keyframes, and compares the first advancing video
 and audio packet timestamps. It also exercises the CPU H.264 conversion branch
 and verifies the resulting codecs and timestamps. Unit tests separately lock
-in FFmpeg's order-sensitive input options and HEVC bitrate policy.
+in FFmpeg's order-sensitive input options, encoder fallback policy, and HEVC
+bitrate policy.
 
 ## Verification
 

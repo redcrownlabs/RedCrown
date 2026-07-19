@@ -1,3 +1,5 @@
+import type { MediaTrack } from "../../shared/contract.generated";
+
 export function formatPlaybackTime(seconds: number) {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
   const totalSeconds = Math.floor(seconds);
@@ -33,4 +35,37 @@ export function subtitleStreamUrl(baseUrl: string, start: number) {
   if (Number.isFinite(start) && start > 0) url.searchParams.set("start", start.toFixed(3));
   else url.searchParams.delete("start");
   return url.toString();
+}
+
+export function trackDisplayLabel(track: MediaTrack, fallback: string) {
+  const title = track.title?.trim();
+  if (title) return title;
+  const language = track.language?.trim();
+  return language ? language.toLocaleUpperCase() : fallback;
+}
+
+export function trackDisplayDetail(track: MediaTrack) {
+  const channelLabel = track.channels === 6
+    ? "5.1"
+    : track.channels === 2
+      ? "Stereo"
+      : track.channels === 1
+        ? "Mono"
+        : track.channels != null
+          ? `${track.channels} channels`
+          : undefined;
+  const codec = {
+    ac3: "AC-3",
+    eac3: "E-AC-3",
+    subrip: "SRT",
+  }[track.codec.toLocaleLowerCase()] ?? track.codec.toLocaleUpperCase();
+  return [
+    track.language?.trim().toLocaleUpperCase(),
+    codec,
+    channelLabel,
+    track.is_default ? "Default" : undefined,
+    track.is_forced ? "Forced" : undefined,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 }

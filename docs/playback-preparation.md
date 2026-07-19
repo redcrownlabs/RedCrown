@@ -72,6 +72,8 @@ CPU OpenH264 encoder because Chromium HEVC support is not dependable across the
 supported Windows installations. Audio is converted to AAC at 192 kbit/s.
 FFmpeg input is rate-limited to a small amount above real time so conversion
 cannot race ahead and turn streaming into an accidental persistent download.
+A bounded five-second initial burst reduces first-frame and seek latency before
+that sustained limit applies.
 
 The HEVC conversion target is derived from the source video bitrate when
 FFprobe exposes it, with a 1.5x allowance for H.264's lower compression
@@ -87,7 +89,10 @@ stream is converted.
 Embedded subtitle selection starts a separate, rate-limited WebVTT conversion
 at the same presentation time. Chromium receives it through a native `<track>`
 element. The container's default audio disposition is honored initially;
-subtitles are off initially and are never chosen from filename guesses.
+subtitles are off initially and are never chosen from filename guesses. Track
+language and title metadata is treated as optional: when a muxer strips both,
+the player preserves every distinct stream and labels it `Subtitle N` rather
+than presenting the subtitle codec as if it were a language.
 
 ## Tradeoffs
 

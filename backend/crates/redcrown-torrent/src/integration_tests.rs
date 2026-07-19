@@ -327,7 +327,11 @@ async fn probe_file(tools: &MediaTools, path: &Path) -> Result<String, Box<dyn E
         .output()
         .await?;
     if !output.status.success() {
-        return Err("FFprobe rejected media bridge output".into());
+        return Err(format!(
+            "FFprobe rejected media bridge output: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
     }
     Ok(String::from_utf8(output.stdout)?)
 }

@@ -9,7 +9,11 @@ import {
   mediaPercent,
   playbackStreamUrl,
   subtitleStreamUrl,
+  trackDisplayDetail,
+  trackDisplayLabel,
 } from "./player-model";
+
+const SEEK_RESTART_DELAY_MS = 120;
 
 type PlayerIconName =
   | "back"
@@ -46,6 +50,8 @@ export function RedCrownPlayer({
   const videoRef = useRef<HTMLVideoElement>(null);
   const ticket = status.ticket;
   const controlsTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const seekTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const pendingSeek = useRef<number | undefined>(undefined);
   const [paused, setPaused] = useState(true);
   const [buffering, setBuffering] = useState(true);
   const [controlsVisible, setControlsVisible] = useState(true);
@@ -68,6 +74,12 @@ export function RedCrownPlayer({
     if (controlsTimer.current) clearTimeout(controlsTimer.current);
   }
 
+  function clearSeekTimer() {
+    if (seekTimer.current) clearTimeout(seekTimer.current);
+    seekTimer.current = undefined;
+    pendingSeek.current = undefined;
+  }
+
   function revealControls() {
     clearControlsTimer();
     setControlsVisible(true);
@@ -81,6 +93,7 @@ export function RedCrownPlayer({
     document.addEventListener("fullscreenchange", onFullscreenChange);
     return () => {
       clearControlsTimer();
+      clearSeekTimer();
       document.removeEventListener("fullscreenchange", onFullscreenChange);
     };
   }, []);
@@ -104,6 +117,7 @@ export function RedCrownPlayer({
     const target = duration > 0
       ? Math.min(Math.max(0, value), Math.max(0, duration - 0.01))
       : Math.max(0, value);
+    clearSeekTimer();
     setStreamStart(target);
     setCurrentTime(target);
     setBufferedUntil(target);
@@ -112,8 +126,30 @@ export function RedCrownPlayer({
     setMediaError(undefined);
   }
 
-  function seekBy(offset: number) {
-    restartStreamAt(clampedSeekTime(currentTime, offset, duration));
+  function seekTo(value: number) {
+    const target = clampedSeekTime(value, 0, duration);
+    const video = videoRef.current;
+    const localTarget = target - streamStart;
+    if (video && localTarget >= 0) {
+      for (let index = 0; index < video.buffered.length; index += 1) {
+        if (localTarget >= video.buffered.start(index) && localTarget <= video.buffered.end(index)) {
+          clearSeekTimer();
+          video.currentTime = localTarget;
+          setCurrentTime(target);
+          setSeekPreview(undefined);
+          return;
+        }
+      }
+    }
+    restartStreamAt(target);
+  }
+
+  function scheduleSeekBy(offset: number) {
+    const target = clampedSeekTime(pendingSeek.current ?? currentTime, offset, duration);
+    if (seekTimer.current) clearTimeout(seekTimer.current);
+    pendingSeek.current = target;
+    setSeekPreview(target);
+    seekTimer.current = setTimeout(() => seekTo(target), SEEK_RESTART_DELAY_MS);
   }
 
   function changeVolume(value: number) {
@@ -157,12 +193,12 @@ export function RedCrownPlayer({
         break;
       case "arrowleft":
         event.preventDefault();
-        seekBy(-10);
+        scheduleSeekBy(-10);
         revealControls();
         break;
       case "arrowright":
         event.preventDefault();
-        seekBy(10);
+        scheduleSeekBy(10);
         revealControls();
         break;
       case "m":
@@ -275,7 +311,10 @@ export function RedCrownPlayer({
                 kind="subtitles"
                 src={subtitleStreamUrl(track.stream_url!, streamStart)}
                 srcLang={track.language ?? "und"}
-                label={trackLabel(track)}
+                label={trackDisplayLabel(
+                  track,
+                  `Subtitle ${ticket.subtitle_tracks.indexOf(track) + 1}`,
+                )}
                 default
               />
             ))}
@@ -331,10 +370,10 @@ export function RedCrownPlayer({
               step="any"
               value={Math.min(seekPreview ?? currentTime, duration || 0)}
               onChange={(event) => setSeekPreview(event.currentTarget.valueAsNumber)}
-              onPointerUp={(event) => restartStreamAt(event.currentTarget.valueAsNumber)}
+              onPointerUp={(event) => seekTo(event.currentTarget.valueAsNumber)}
               onKeyUp={(event) => {
                 if (["ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"].includes(event.key)) {
-                  restartStreamAt(event.currentTarget.valueAsNumber);
+                  seekTo(event.currentTarget.valueAsNumber);
                 }
               }}
               aria-valuetext={`${formatPlaybackTime(currentTime)} of ${formatPlaybackTime(duration)}`}
@@ -416,6 +455,8 @@ function TrackPicker({
 }) {
   const detailsRef = useRef<HTMLDetailsElement>(null);
   const selectedTrack = tracks.find((track) => track.id === selected);
+  const fallbackNoun = label === "Subtitles" ? "Subtitle" : label;
+  const selectedIndex = selectedTrack ? tracks.indexOf(selectedTrack) : -1;
   if (!tracks.length) return null;
 
   function choose(track?: number) {
@@ -425,39 +466,22 @@ function TrackPicker({
 
   return (
     <details className="player-track-picker" ref={detailsRef}>
-      <summary>{label}<span>{selectedTrack ? trackLabel(selectedTrack) : "Off"}</span></summary>
+      <summary>{label}<span>{selectedTrack
+        ? trackDisplayLabel(selectedTrack, `${fallbackNoun} ${selectedIndex + 1}`)
+        : "Off"}</span></summary>
       <div className="player-track-list">
         {allowOff && (
           <button className={selected == null ? "active" : ""} type="button" aria-pressed={selected == null} onClick={() => choose()}>
             <span>Off</span>
           </button>
         )}
-        {tracks.map((track) => (
+        {tracks.map((track, index) => (
           <button className={selected === track.id ? "active" : ""} type="button" aria-pressed={selected === track.id} key={track.id} onClick={() => choose(track.id)}>
-            <span>{trackLabel(track)}</span>
-            <small>{trackDetail(track)}</small>
+            <span>{trackDisplayLabel(track, `${fallbackNoun} ${index + 1}`)}</span>
+            <small>{trackDisplayDetail(track)}</small>
           </button>
         ))}
       </div>
     </details>
   );
-}
-
-function trackLabel(track: MediaTrack) {
-  return track.title ?? track.language?.toUpperCase() ?? track.codec.toUpperCase();
-}
-
-function trackDetail(track: MediaTrack) {
-  const channelLabel = track.channels === 6
-    ? "5.1"
-    : track.channels === 2
-      ? "Stereo"
-      : track.channels === 1
-        ? "Mono"
-        : track.channels != null
-          ? `${track.channels} channels`
-          : undefined;
-  return [track.language?.toUpperCase(), track.codec.toUpperCase(), channelLabel]
-    .filter(Boolean)
-    .join(" · ");
 }

@@ -6,6 +6,8 @@ import {
   mediaPercent,
   playbackStreamUrl,
   subtitleStreamUrl,
+  trackDisplayDetail,
+  trackDisplayLabel,
 } from "./player-model";
 
 describe("player formatting and seeking", () => {
@@ -31,6 +33,34 @@ describe("player formatting and seeking", () => {
     expect(subtitleStreamUrl("http://127.0.0.1/subtitle/1/2/6?token=secret", 42.25)).toBe(
       "http://127.0.0.1/subtitle/1/2/6?token=secret&start=42.250",
     );
+  });
+});
+
+describe("track presentation", () => {
+  it("numbers subtitle streams whose muxer omitted language metadata", () => {
+    const track = {
+      id: 2,
+      codec: "subrip",
+      is_default: true,
+      is_forced: false,
+    };
+
+    expect(trackDisplayLabel(track, "Subtitle 1")).toBe("Subtitle 1");
+    expect(trackDisplayDetail(track)).toBe("SRT · Default");
+  });
+
+  it("prefers real track metadata over generated labels", () => {
+    const track = {
+      id: 6,
+      codec: "subrip",
+      language: "eng",
+      title: "English (SDH)",
+      is_default: false,
+      is_forced: true,
+    };
+
+    expect(trackDisplayLabel(track, "Subtitle 2")).toBe("English (SDH)");
+    expect(trackDisplayDetail(track)).toBe("ENG · SRT · Forced");
   });
 });
 
