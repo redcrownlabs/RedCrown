@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import type { CSSProperties, KeyboardEvent, MouseEvent } from "react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
+import type { CSSProperties, MouseEvent } from "react";
 
 import type { MediaItem, MediaTrack, PlaybackStatus } from "../../shared/contract.generated";
 import { formatBytes, formatDownloadSpeed } from "./playback-model";
@@ -140,9 +140,15 @@ export function RedCrownPlayer({
     }
   }
 
-  function handleKeyboard(event: KeyboardEvent<HTMLDivElement>) {
+  const handleKeyboard = useEffectEvent((event: globalThis.KeyboardEvent) => {
     const target = event.target;
-    if (target instanceof HTMLInputElement || target instanceof HTMLButtonElement) return;
+    if (
+      target instanceof HTMLInputElement
+      || target instanceof HTMLTextAreaElement
+      || target instanceof HTMLSelectElement
+      || (target instanceof HTMLElement && target.isContentEditable)
+    ) return;
+    if (event.key === " " && target instanceof HTMLButtonElement) return;
     switch (event.key.toLowerCase()) {
       case " ":
       case "k":
@@ -170,7 +176,12 @@ export function RedCrownPlayer({
         if (!document.fullscreenElement) onClose();
         break;
     }
-  }
+  });
+
+  useEffect(() => {
+    document.addEventListener("keydown", handleKeyboard);
+    return () => document.removeEventListener("keydown", handleKeyboard);
+  }, []);
 
   function updateBuffered() {
     const video = videoRef.current;
@@ -205,7 +216,6 @@ export function RedCrownPlayer({
         role="group"
         aria-label="Video playback controls"
         tabIndex={0}
-        onKeyDown={handleKeyboard}
         onMouseMove={revealControls}
         onMouseLeave={() => {
           if (!paused) setControlsVisible(false);

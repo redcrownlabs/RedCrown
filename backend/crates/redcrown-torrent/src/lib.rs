@@ -70,6 +70,21 @@ const MAX_MEDIA_ERROR_BYTES: u64 = 64 * 1024;
 const MEDIA_PIPE_BYTES: usize = 1024 * 1024;
 /// H.264 can be copied into fragmented MP4 without video quality loss.
 const COMPATIBLE_VIDEO_CODEC: &str = "h264";
+/// HEVC requires conversion because Chromium does not provide dependable playback support.
+const TRANSCODED_VIDEO_CODEC: &str = "hevc";
+/// H.264 needs additional bitrate to retain detail from a more efficient HEVC source.
+const HEVC_TO_H264_BITRATE_NUMERATOR: u64 = 3;
+const HEVC_TO_H264_BITRATE_DENOMINATOR: u64 = 2;
+/// Low-resolution sources still need enough bitrate to avoid visible `OpenH264` artifacts.
+const MIN_H264_TRANSCODE_BITRATE: u64 = 2_000_000;
+/// This bound prevents one playback process from producing an excessive local stream.
+const MAX_H264_TRANSCODE_BITRATE: u64 = 40_000_000;
+/// A short GOP keeps fragmented playback responsive without excessive keyframes.
+const H264_TRANSCODE_GOP_FRAMES: &str = "60";
+/// PQ HDR is normalized and tone-mapped into Chromium-compatible BT.709 SDR.
+const PQ_TO_SDR_FILTER: &str = "zscale=primariesin=bt2020:transferin=smpte2084:matrixin=bt2020nc:rangein=limited:transfer=linear:npl=100,format=gbrpf32le,tonemap=mobius:desat=0,zscale=primaries=bt709:transfer=bt709:matrix=bt709:range=limited,format=yuv420p";
+/// HLG HDR uses the same output policy with its distinct source transfer function.
+const HLG_TO_SDR_FILTER: &str = "zscale=primariesin=bt2020:transferin=arib-std-b67:matrixin=bt2020nc:rangein=limited:transfer=linear:npl=100,format=gbrpf32le,tonemap=mobius:desat=0,zscale=primaries=bt709:transfer=bt709:matrix=bt709:range=limited,format=yuv420p";
 
 /// Identifies the pinned media executables used by playback.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,9 +303,25 @@ struct StreamState {
 struct MediaManifest {
     native_url: String,
     duration_seconds: Option<f64>,
+    video_bridge: VideoBridge,
     audio_track_ids: HashSet<usize>,
     subtitle_track_ids: HashSet<usize>,
     default_audio_track: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoBridge {
+    CopyH264,
+    TranscodeToH264 {
+        bitrate: u64,
+        hdr_transfer: Option<HdrTransfer>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HdrTransfer {
+    Hlg,
+    Pq,
 }
 
 /// Owns the torrent session and loopback stream endpoint.
@@ -819,20 +850,16 @@ impl TorrentEngine {
         mut ticket: PlaybackTicket,
     ) -> Result<PlaybackTicket, TorrentError> {
         let output = probe_media(&self.ffprobe, &ticket.stream_url).await?;
-        let video_codec = output
+        let video_stream = output
             .streams
             .iter()
             .find(|stream| stream.codec_type.as_deref() == Some("video"))
-            .and_then(|stream| stream.codec_name.as_deref())
             .ok_or_else(|| TorrentError::new("selected media has no identifiable video track"))?;
-        if video_codec != COMPATIBLE_VIDEO_CODEC {
-            return Err(TorrentError::new(format!(
-                "video codec {video_codec} is not yet supported by the quality-preserving media bridge"
-            )));
-        }
+        let video_bridge = select_video_bridge(video_stream, output.format.as_ref())?;
         let duration_seconds = output
             .format
-            .and_then(|format| format.duration)
+            .as_ref()
+            .and_then(|format| format.duration.as_deref())
             .and_then(|duration| duration.parse::<f64>().ok())
             .filter(|duration| duration.is_finite() && *duration > 0.0);
         let mut audio_tracks = Vec::new();
@@ -883,6 +910,7 @@ impl TorrentEngine {
             MediaManifest {
                 native_url: ticket.stream_url.clone(),
                 duration_seconds,
+                video_bridge,
                 audio_track_ids: audio_tracks.iter().map(|track| track.id).collect(),
                 subtitle_track_ids: subtitle_tracks.iter().map(|track| track.id).collect(),
                 default_audio_track,
@@ -1291,6 +1319,10 @@ struct ProbeStream {
     index: usize,
     codec_name: Option<String>,
     codec_type: Option<String>,
+    bit_rate: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    color_transfer: Option<String>,
     channels: Option<u16>,
     #[serde(default)]
     disposition: ProbeDisposition,
@@ -1313,6 +1345,7 @@ struct ProbeTags {
 #[derive(Debug, Deserialize)]
 struct ProbeFormat {
     duration: Option<String>,
+    bit_rate: Option<String>,
 }
 
 async fn probe_media(ffprobe: &FsPath, source: &str) -> Result<ProbeOutput, TorrentError> {
@@ -1323,9 +1356,9 @@ async fn probe_media(ffprobe: &FsPath, source: &str) -> Result<ProbeOutput, Torr
                 "-v",
                 "error",
                 "-show_entries",
-                "stream=index,codec_type,codec_name,channels:stream_tags=language,title:stream_disposition=default,forced",
+                "stream=index,codec_type,codec_name,bit_rate,width,height,color_transfer,channels:stream_tags=language,title:stream_disposition=default,forced",
                 "-show_entries",
-                "format=duration",
+                "format=duration,bit_rate",
                 "-of",
                 "json",
                 source,
@@ -1348,6 +1381,73 @@ async fn probe_media(ffprobe: &FsPath, source: &str) -> Result<ProbeOutput, Torr
 fn parse_probe_output(bytes: &[u8]) -> Result<ProbeOutput, TorrentError> {
     serde_json::from_slice(bytes)
         .map_err(|error| TorrentError::new(format!("invalid media inspection response: {error}")))
+}
+
+fn select_video_bridge(
+    stream: &ProbeStream,
+    format: Option<&ProbeFormat>,
+) -> Result<VideoBridge, TorrentError> {
+    let codec = stream
+        .codec_name
+        .as_deref()
+        .ok_or_else(|| TorrentError::new("selected media has no identifiable video codec"))?;
+    match codec {
+        COMPATIBLE_VIDEO_CODEC => Ok(VideoBridge::CopyH264),
+        TRANSCODED_VIDEO_CODEC => {
+            let source_bitrate = parse_positive_bitrate(stream.bit_rate.as_deref()).or_else(|| {
+                format.and_then(|value| parse_positive_bitrate(value.bit_rate.as_deref()))
+            });
+            Ok(VideoBridge::TranscodeToH264 {
+                bitrate: h264_transcode_bitrate(source_bitrate, stream.width, stream.height),
+                hdr_transfer: match stream.color_transfer.as_deref() {
+                    Some("arib-std-b67") => Some(HdrTransfer::Hlg),
+                    Some("smpte2084") => Some(HdrTransfer::Pq),
+                    Some(_) | None => None,
+                },
+            })
+        }
+        _ => Err(TorrentError::new(format!(
+            "video codec {codec} is not supported by the media bridge"
+        ))),
+    }
+}
+
+fn parse_positive_bitrate(value: Option<&str>) -> Option<u64> {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn h264_transcode_bitrate(
+    source_bitrate: Option<u64>,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> u64 {
+    let target = source_bitrate.map_or_else(
+        || resolution_bitrate(width, height),
+        |bitrate| {
+            bitrate.saturating_mul(HEVC_TO_H264_BITRATE_NUMERATOR)
+                / HEVC_TO_H264_BITRATE_DENOMINATOR
+        },
+    );
+    target.clamp(MIN_H264_TRANSCODE_BITRATE, MAX_H264_TRANSCODE_BITRATE)
+}
+
+fn resolution_bitrate(width: Option<u32>, height: Option<u32>) -> u64 {
+    let pixels = u64::from(width.unwrap_or(1920)) * u64::from(height.unwrap_or(1080));
+    match pixels {
+        0..=921_600 => 5_000_000,
+        921_601..=2_073_600 => 8_000_000,
+        2_073_601..=3_686_400 => 12_000_000,
+        _ => 24_000_000,
+    }
+}
+
+fn hdr_to_sdr_filter(transfer: HdrTransfer) -> &'static str {
+    match transfer {
+        HdrTransfer::Hlg => HLG_TO_SDR_FILTER,
+        HdrTransfer::Pq => PQ_TO_SDR_FILTER,
+    }
 }
 
 fn bounded_process_error(bytes: &[u8]) -> String {
@@ -1474,6 +1574,21 @@ async fn build_playback_response(
     {
         return Err(TorrentError::new("requested playback position is invalid"));
     }
+    let arguments = playback_arguments(
+        &manifest.native_url,
+        audio_track,
+        start,
+        manifest.video_bridge,
+    );
+    media_process_response(&state.ffmpeg, &arguments, "video/mp4")
+}
+
+fn playback_arguments(
+    native_url: &str,
+    audio_track: Option<usize>,
+    start: f64,
+    video_bridge: VideoBridge,
+) -> Vec<String> {
     let mut arguments = vec![
         "-nostdin".to_owned(),
         "-hide_banner".to_owned(),
@@ -1481,26 +1596,60 @@ async fn build_playback_response(
         "error".to_owned(),
     ];
     if start > 0.0 {
+        if video_bridge == VideoBridge::CopyH264 {
+            arguments.push("-noaccurate_seek".to_owned());
+        }
         arguments.extend(["-ss".to_owned(), format!("{start:.3}")]);
     }
     arguments.extend([
         "-readrate".to_owned(),
         "1.1".to_owned(),
         "-i".to_owned(),
-        manifest.native_url,
+        native_url.to_owned(),
         "-map".to_owned(),
         "0:v:0".to_owned(),
     ]);
     if let Some(audio_track) = audio_track {
         arguments.extend(["-map".to_owned(), format!("0:{audio_track}")]);
     }
+    match video_bridge {
+        VideoBridge::CopyH264 => {
+            arguments.extend(["-c:v".to_owned(), "copy".to_owned()]);
+        }
+        VideoBridge::TranscodeToH264 {
+            bitrate,
+            hdr_transfer,
+        } => {
+            arguments.extend([
+                "-c:v".to_owned(),
+                "libopenh264".to_owned(),
+                "-profile:v".to_owned(),
+                "high".to_owned(),
+                "-rc_mode".to_owned(),
+                "quality".to_owned(),
+                "-b:v".to_owned(),
+                bitrate.to_string(),
+            ]);
+            if let Some(transfer) = hdr_transfer {
+                arguments.extend(["-vf".to_owned(), hdr_to_sdr_filter(transfer).to_owned()]);
+            }
+            arguments.extend([
+                "-pix_fmt".to_owned(),
+                "yuv420p".to_owned(),
+                "-g".to_owned(),
+                H264_TRANSCODE_GOP_FRAMES.to_owned(),
+                "-fps_mode".to_owned(),
+                "passthrough".to_owned(),
+            ]);
+        }
+    }
     arguments.extend([
-        "-c:v".to_owned(),
-        "copy".to_owned(),
         "-c:a".to_owned(),
         "aac".to_owned(),
         "-b:a".to_owned(),
         "192k".to_owned(),
+        "-af".to_owned(),
+        "aresample=async=1000".to_owned(),
         "-map_metadata".to_owned(),
         "-1".to_owned(),
         "-movflags".to_owned(),
@@ -1509,7 +1658,7 @@ async fn build_playback_response(
         "mp4".to_owned(),
         "pipe:1".to_owned(),
     ]);
-    media_process_response(&state.ffmpeg, &arguments, "video/mp4")
+    arguments
 }
 
 async fn build_subtitle_response(
@@ -1757,9 +1906,10 @@ mod tests {
     use axum::http::HeaderValue;
 
     use super::{
-        DHT_STATE_FILENAME, ListenerMode, MAX_START_BUFFER_BYTES, MIN_START_BUFFER_BYTES,
-        TorrentFile, magnet_link, parse_probe_output, parse_range, select_media_file,
-        session_options, start_buffer_target,
+        DHT_STATE_FILENAME, HdrTransfer, ListenerMode, MAX_START_BUFFER_BYTES,
+        MIN_START_BUFFER_BYTES, TorrentFile, VideoBridge, h264_transcode_bitrate, magnet_link,
+        parse_probe_output, parse_range, playback_arguments, select_media_file,
+        select_video_bridge, session_options, start_buffer_target,
     };
 
     #[test]
@@ -1911,6 +2061,141 @@ mod tests {
         assert_eq!(
             output.format.and_then(|format| format.duration).as_deref(),
             Some("6874.752000")
+        );
+    }
+
+    #[test]
+    fn selects_bounded_hevc_compatibility_transcoding() {
+        let output = parse_probe_output(
+            br#"{
+                "streams": [{
+                    "index": 0,
+                    "codec_name": "hevc",
+                    "codec_type": "video",
+                    "bit_rate": "8000000",
+                    "width": 1920,
+                    "height": 1080,
+                    "color_transfer": "smpte2084"
+                }],
+                "format": { "duration": "120", "bit_rate": "9000000" }
+            }"#,
+        )
+        .expect("probe output");
+
+        assert_eq!(
+            select_video_bridge(&output.streams[0], output.format.as_ref()).expect("HEVC bridge"),
+            VideoBridge::TranscodeToH264 {
+                bitrate: 12_000_000,
+                hdr_transfer: Some(HdrTransfer::Pq),
+            }
+        );
+        assert_eq!(
+            h264_transcode_bitrate(Some(100_000_000), Some(3840), Some(2160)),
+            40_000_000
+        );
+        assert_eq!(
+            h264_transcode_bitrate(None, Some(3840), Some(2160)),
+            24_000_000
+        );
+    }
+
+    #[test]
+    fn rejects_unqualified_video_codecs() {
+        let output = parse_probe_output(
+            br#"{
+                "streams": [{
+                    "index": 0,
+                    "codec_name": "av1",
+                    "codec_type": "video",
+                    "width": 1920,
+                    "height": 1080
+                }]
+            }"#,
+        )
+        .expect("probe output");
+
+        let error = select_video_bridge(&output.streams[0], None)
+            .expect_err("AV1 must remain unsupported until qualified");
+        assert!(error.summary().contains("video codec av1 is not supported"));
+    }
+
+    #[test]
+    fn seeked_playback_preserves_keyframe_preroll_for_audio_and_video() {
+        let arguments = playback_arguments(
+            "http://127.0.0.1/media",
+            Some(2),
+            13.5,
+            VideoBridge::CopyH264,
+        );
+        let noaccurate_seek = arguments
+            .iter()
+            .position(|argument| argument == "-noaccurate_seek")
+            .expect("non-accurate seek option");
+        let seek = arguments
+            .iter()
+            .position(|argument| argument == "-ss")
+            .expect("seek option");
+        let input = arguments
+            .iter()
+            .position(|argument| argument == "-i")
+            .expect("input option");
+
+        assert!(noaccurate_seek < seek && seek < input);
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| { pair == ["-af".to_owned(), "aresample=async=1000".to_owned()] })
+        );
+    }
+
+    #[test]
+    fn playback_from_the_beginning_does_not_request_input_seeking() {
+        let arguments = playback_arguments(
+            "http://127.0.0.1/media",
+            Some(2),
+            0.0,
+            VideoBridge::CopyH264,
+        );
+
+        assert!(!arguments.iter().any(|argument| argument == "-ss"));
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument == "-noaccurate_seek")
+        );
+    }
+
+    #[test]
+    fn hevc_transcoding_uses_accurate_seek_and_the_bundled_cpu_encoder() {
+        let arguments = playback_arguments(
+            "http://127.0.0.1/media",
+            Some(2),
+            13.5,
+            VideoBridge::TranscodeToH264 {
+                bitrate: 12_000_000,
+                hdr_transfer: Some(HdrTransfer::Pq),
+            },
+        );
+
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument == "-noaccurate_seek")
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["-c:v".to_owned(), "libopenh264".to_owned()])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["-b:v".to_owned(), "12000000".to_owned()])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| { pair[0] == "-vf" && pair[1].contains("transferin=smpte2084") })
         );
     }
 }

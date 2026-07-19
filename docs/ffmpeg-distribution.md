@@ -39,8 +39,11 @@ are integration-tested.
 FFprobe is the source of truth for track indexes, codecs, language tags,
 titles, dispositions, and duration. The renderer never infers tracks from a
 filename. FFmpeg receives only indexes that were returned by that manifest.
-Audio selected by the user is converted to AAC while compatible video is
-stream-copied, avoiding needless video quality loss and CPU cost. Subtitle
-tracks are converted to WebVTT for Chromium's native text-track interface.
-Both playback and subtitle inputs are rate-limited so track handling does not
-eagerly consume the complete torrent.
+Audio selected by the user is converted to AAC while compatible H.264 video is
+stream-copied, avoiding needless video quality loss and CPU cost. HEVC is
+decoded and converted to H.264 by the packaged CPU OpenH264 encoder so playback
+does not depend on optional Windows codecs or GPU drivers. PQ and HLG sources
+are tone-mapped to BT.709 SDR by the packaged zscale and tonemap filters before
+encoding. Subtitle tracks are converted to WebVTT for Chromium's native
+text-track interface. Both playback and subtitle inputs are rate-limited so
+track handling does not eagerly consume the complete torrent.

@@ -80,6 +80,29 @@ session-only, and deleting or expiring an entry removes its media and bitfield
 together. A failed validation clears the bitfield and falls back to a complete
 hash check, preserving BitTorrent integrity.
 
+## Playback timeline invariant
+
+The loopback media bridge copies compatible H.264 video to keep startup and
+seeking responsive, while transcoding unsupported audio to AAC. HEVC video is
+converted to H.264 and can therefore use accurate input seeking. After a seek,
+every emitted track must retain the same relative source timeline. Accurate
+input seeking cannot satisfy that invariant when H.264 video is copied: FFmpeg
+keeps video from the preceding keyframe but discards the corresponding decoded
+audio pre-roll.
+
+Seeked H.264-copy playback therefore places `-noaccurate_seek` before the input
+`-ss` and uses asynchronous audio resampling for small timestamp drift. Video
+and audio then begin at the same preceding keyframe boundary. The accepted
+tradeoff is that a copied-video seek may resume slightly before the requested
+time by at most one source GOP. HEVC playback already pays the conversion cost,
+so it retains accurate seeking instead.
+
+The media bridge integration test uses a deterministic long-GOP video with
+E-AC-3 audio, seeks between keyframes, and compares the first advancing video
+and audio packet timestamps. It also exercises the CPU H.264 conversion branch
+and verifies the resulting codecs and timestamps. Unit tests separately lock
+in FFmpeg's order-sensitive input options and HEVC bitrate policy.
+
 ## Verification
 
 Deterministic tests lock in:

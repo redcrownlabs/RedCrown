@@ -20,7 +20,10 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use super::{MediaTools, PlaybackPreparation, PlaybackStage, PreparationSnapshot, TorrentEngine};
+use super::{
+    HdrTransfer, MediaTools, PlaybackPreparation, PlaybackStage, PreparationSnapshot,
+    TorrentEngine, VideoBridge,
+};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 const TEST_FILE_BYTES: usize = 1024 * 1024;
@@ -145,6 +148,54 @@ async fn media_bridge_transcodes_audio_and_exposes_subtitles() -> Result<(), Box
     assert!(probe.contains("\"codec_name\": \"aac\""));
     assert!(probe.contains("\"codec_type\": \"video\""));
 
+    let mut seek_url = reqwest::Url::parse(&ticket.playback_url)?;
+    seek_url.query_pairs_mut().append_pair("start", "3.000");
+    let seeked_media = reqwest::get(seek_url).await?.bytes().await?;
+    let seeked_output_path = client_root.path().join("media-bridge-seek-output.mp4");
+    tokio::fs::write(&seeked_output_path, seeked_media).await?;
+    let video_timestamps = probe_packet_timestamps(&tools, &seeked_output_path, "v:0").await?;
+    let audio_timestamps = probe_packet_timestamps(&tools, &seeked_output_path, "a:0").await?;
+    let first_advancing_video = first_advancing_timestamp(&video_timestamps)?;
+    let first_advancing_audio = first_advancing_timestamp(&audio_timestamps)?;
+    assert!(
+        (first_advancing_video - first_advancing_audio).abs() <= 0.05,
+        "seeked bridge output started out of sync: video={video_timestamps:?}, audio={audio_timestamps:?}"
+    );
+
+    {
+        let mut manifests = engine.media_manifests.write().await;
+        let manifest = manifests
+            .get_mut(&(ticket.torrent_id, ticket.file_id))
+            .ok_or("media manifest missing")?;
+        manifest.video_bridge = VideoBridge::TranscodeToH264 {
+            bitrate: 1_000_000,
+            hdr_transfer: Some(HdrTransfer::Pq),
+        };
+    }
+    let mut transcoded_url = reqwest::Url::parse(&ticket.playback_url)?;
+    transcoded_url
+        .query_pairs_mut()
+        .append_pair("start", "8.000");
+    let transcoded_media = reqwest::get(transcoded_url).await?.bytes().await?;
+    let transcoded_output_path = client_root
+        .path()
+        .join("media-bridge-transcoded-output.mp4");
+    tokio::fs::write(&transcoded_output_path, transcoded_media).await?;
+    let transcoded_probe = probe_file(&tools, &transcoded_output_path).await?;
+    assert!(transcoded_probe.contains("\"codec_name\": \"h264\""));
+    assert!(transcoded_probe.contains("\"codec_name\": \"aac\""));
+    assert!(transcoded_probe.contains("\"color_transfer\": \"bt709\""));
+    let transcoded_video_timestamps =
+        probe_packet_timestamps(&tools, &transcoded_output_path, "v:0").await?;
+    let transcoded_audio_timestamps =
+        probe_packet_timestamps(&tools, &transcoded_output_path, "a:0").await?;
+    let first_transcoded_video = first_advancing_timestamp(&transcoded_video_timestamps)?;
+    let first_transcoded_audio = first_advancing_timestamp(&transcoded_audio_timestamps)?;
+    assert!(
+        (first_transcoded_video - first_transcoded_audio).abs() <= 0.05,
+        "transcoded bridge output started out of sync: video={transcoded_video_timestamps:?}, audio={transcoded_audio_timestamps:?}"
+    );
+
     let subtitle_url = ticket.subtitle_tracks[0]
         .stream_url
         .as_deref()
@@ -167,11 +218,25 @@ async fn create_media_fixture(
     .await?;
     let status = Command::new(&tools.ffmpeg)
         .args(["-y", "-nostdin", "-hide_banner", "-loglevel", "error"])
-        .args(["-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24"])
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=24,format=yuv420p,setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
+        ])
         .args(["-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000"])
         .arg("-i")
         .arg(subtitles)
-        .args(["-t", "3", "-c:v", "libopenh264", "-b:v", "500k"])
+        .args([
+            "-t",
+            "10",
+            "-c:v",
+            "libopenh264",
+            "-g",
+            "96",
+            "-b:v",
+            "500k",
+        ])
         .args(["-c:a", "eac3", "-c:s", "srt"])
         .arg(output)
         .stdin(Stdio::null())
@@ -255,7 +320,7 @@ async fn probe_file(tools: &MediaTools, path: &Path) -> Result<String, Box<dyn E
             "-v",
             "error",
             "-show_entries",
-            "stream=codec_name,codec_type",
+            "stream=codec_name,codec_type,pix_fmt,color_space,color_transfer,color_primaries",
         ])
         .args(["-of", "json"])
         .arg(path)
@@ -265,6 +330,37 @@ async fn probe_file(tools: &MediaTools, path: &Path) -> Result<String, Box<dyn E
         return Err("FFprobe rejected media bridge output".into());
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+async fn probe_packet_timestamps(
+    tools: &MediaTools,
+    path: &Path,
+    stream: &str,
+) -> Result<Vec<f64>, Box<dyn Error>> {
+    let output = Command::new(&tools.ffprobe)
+        .args(["-v", "error", "-select_streams", stream])
+        .args(["-read_intervals", "%+#3"])
+        .args(["-show_entries", "packet=pts_time", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(format!("FFprobe could not inspect {stream} packet timestamps").into());
+    }
+    String::from_utf8(output.stdout)?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| line.parse::<f64>().map_err(Into::into))
+        .collect()
+}
+
+fn first_advancing_timestamp(timestamps: &[f64]) -> Result<f64, Box<dyn Error>> {
+    timestamps
+        .iter()
+        .copied()
+        .find(|timestamp| *timestamp > 0.001)
+        .ok_or_else(|| "FFprobe returned no advancing packet timestamp".into())
 }
 
 #[tokio::test(flavor = "multi_thread")]

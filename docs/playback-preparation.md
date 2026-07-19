@@ -66,10 +66,23 @@ is bounded before logging.
 
 Audio selection restarts the compatibility stream at the current presentation
 time with the requested track. Seeking uses the same restart mechanism because
-a live fragmented output cannot satisfy arbitrary byte ranges. Video is copied
-and audio is converted to AAC at 192 kbit/s. FFmpeg input is rate-limited to a
-small amount above real time so conversion cannot race ahead and turn streaming
-into an accidental persistent download.
+a live fragmented output cannot satisfy arbitrary byte ranges. H.264 video is
+copied without generation loss. HEVC video is converted to H.264 by the bundled
+CPU OpenH264 encoder because Chromium HEVC support is not dependable across the
+supported Windows installations. Audio is converted to AAC at 192 kbit/s.
+FFmpeg input is rate-limited to a small amount above real time so conversion
+cannot race ahead and turn streaming into an accidental persistent download.
+
+The HEVC conversion target is derived from the source video bitrate when
+FFprobe exposes it, with a 1.5x allowance for H.264's lower compression
+efficiency and a 2–40 Mbit/s safety range. Resolution-based targets from 5 to
+24 Mbit/s are used when bitrate metadata is absent. Conversion always uses
+8-bit 4:2:0 H.264 High profile for Chromium compatibility and a bounded GOP for
+responsive fragmented playback. PQ and HLG HDR transfers are normalized,
+tone-mapped with FFmpeg's deterministic Mobius filter, and emitted as BT.709
+SDR instead of being truncated into incorrect 8-bit color. The source file and
+torrent cache remain untouched; only the temporary loopback presentation
+stream is converted.
 
 Embedded subtitle selection starts a separate, rate-limited WebVTT conversion
 at the same presentation time. Chromium receives it through a native `<track>`
@@ -87,10 +100,12 @@ Polling uses one chained request at a time. A push channel could reduce status
 traffic later, but polling keeps the IPC contract simple and prevents stale or
 overlapping requests during cancellation.
 
-The compatibility bridge currently optimizes the common H.264 torrent path by
-copying video. Preparation rejects other source video codecs with a clear error.
-Additional codecs must be qualified deliberately; they must not silently fall
-back to lossy or hardware-dependent encoders.
+The compatibility bridge optimizes the common H.264 torrent path by copying
+video and explicitly qualifies HEVC through deterministic CPU conversion.
+HEVC conversion costs CPU and is necessarily lossy, but avoids hardware- and
+driver-dependent behavior. Other source video codecs remain rejected until
+their decode, encode, seek, synchronization, and packaged-runtime behavior are
+qualified deliberately.
 
 ## Diagnostics
 
