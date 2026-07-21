@@ -16,11 +16,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
-const DATABASE_SCHEMA_VERSION: i64 = 2;
+const DATABASE_SCHEMA_VERSION: i64 = 3;
 const MAX_SETTINGS_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_LIBRARY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_METADATA_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_NEDB_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LIBRARY_TITLE_CHARS: usize = 512;
 
 /// Selects which compatible data categories are imported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,7 +77,7 @@ pub struct PopcornProfilePreview {
 }
 
 /// Describes one durable library item.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryItem {
     /// Stable provider identifier, usually `IMDb`.
     pub external_id: String,
@@ -91,13 +92,43 @@ pub struct LibraryItem {
 }
 
 /// Identifies a durable library category.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LibraryMediaKind {
     /// Feature-length movie.
     Movie,
     /// Episodic series.
     Series,
+}
+
+/// Identifies one regular episode in a watched-series snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LibraryEpisode {
+    /// One-based season number.
+    pub season: u32,
+    /// One-based episode number.
+    pub episode: u32,
+}
+
+/// Describes the latest watched point for one series.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WatchedSeries {
+    /// Stable provider identifier used by catalog detail requests.
+    pub external_id: String,
+    /// Display title when known.
+    pub title: Option<String>,
+    /// Release year when known.
+    pub year: Option<u16>,
+    /// Poster URL when known.
+    pub poster_url: Option<String>,
+    /// Latest watched regular season.
+    pub latest_season: u32,
+    /// Latest watched episode in `latest_season`.
+    pub latest_episode: u32,
+    /// Most recent watched timestamp in Unix milliseconds.
+    pub watched_at_ms: Option<i64>,
+    /// Exact regular episodes currently marked watched.
+    pub episodes: Vec<LibraryEpisode>,
 }
 
 impl LibraryMediaKind {
@@ -122,6 +153,10 @@ pub struct LibrarySummary {
     pub favorites: Vec<LibraryItem>,
     /// Watched movie records used to suppress completed titles from discovery.
     pub watched_movies: Vec<LibraryItem>,
+    /// Latest watched frontier for each series with episode history.
+    pub watched_series: Vec<WatchedSeries>,
+    /// Series identities explicitly suppressed from Continue Watching.
+    pub continue_watching_hidden: Vec<String>,
 }
 
 /// Reports the durable part of a completed import.
@@ -188,6 +223,101 @@ impl Library {
     /// Returns an error when the database cannot be locked or queried.
     pub fn summary(&self) -> Result<LibrarySummary, LibraryError> {
         let connection = self.connection.lock().map_err(LibraryError::poisoned)?;
+        query_summary(&connection)
+    }
+
+    /// Sets durable watched state for a movie or series snapshot.
+    ///
+    /// Series updates target exactly one selected regular episode. Later catalog
+    /// episodes remain unwatched and can therefore enter Continue Watching.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when identity, metadata, episode numbers, or storage is invalid.
+    pub fn set_watched(
+        &self,
+        item: &LibraryItem,
+        episodes: &[LibraryEpisode],
+        watched: bool,
+    ) -> Result<LibrarySummary, LibraryError> {
+        validate_library_item(item)?;
+        validate_watched_selection(item.kind, episodes)?;
+        let mut connection = self.connection.lock().map_err(LibraryError::poisoned)?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| LibraryError::from_sql(&error))?;
+        match item.kind {
+            LibraryMediaKind::Movie => set_movie_watched(&transaction, item, watched)?,
+            LibraryMediaKind::Series => {
+                if watched {
+                    set_continue_watching_hidden(&transaction, item, false)?;
+                }
+                set_series_watched(&transaction, item, episodes, watched)?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| LibraryError::from_sql(&error))?;
+        query_summary(&connection)
+    }
+
+    /// Marks every currently known regular episode of a series as watched.
+    ///
+    /// This title-level operation is intentionally separate from [`Self::set_watched`],
+    /// whose single-episode invariant protects detail-view mutations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the item is not a series, the snapshot is empty or invalid,
+    /// or storage fails.
+    pub fn mark_series_watched(
+        &self,
+        item: &LibraryItem,
+        episodes: &[LibraryEpisode],
+    ) -> Result<LibrarySummary, LibraryError> {
+        validate_library_item(item)?;
+        if item.kind != LibraryMediaKind::Series {
+            return Err(LibraryError::new(
+                "title-level series watched state requires a series",
+            ));
+        }
+        validate_episode_snapshot(episodes)?;
+        let mut connection = self.connection.lock().map_err(LibraryError::poisoned)?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| LibraryError::from_sql(&error))?;
+        set_continue_watching_hidden(&transaction, item, false)?;
+        set_series_watched(&transaction, item, episodes, true)?;
+        transaction
+            .commit()
+            .map_err(|error| LibraryError::from_sql(&error))?;
+        query_summary(&connection)
+    }
+
+    /// Sets durable Continue Watching suppression without changing watched history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the item is not a valid series or storage fails.
+    pub fn set_continue_watching_hidden(
+        &self,
+        item: &LibraryItem,
+        hidden: bool,
+    ) -> Result<LibrarySummary, LibraryError> {
+        validate_library_item(item)?;
+        if item.kind != LibraryMediaKind::Series {
+            return Err(LibraryError::new(
+                "Continue Watching state requires a series",
+            ));
+        }
+        let mut connection = self.connection.lock().map_err(LibraryError::poisoned)?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| LibraryError::from_sql(&error))?;
+        set_continue_watching_hidden(&transaction, item, hidden)?;
+        transaction
+            .commit()
+            .map_err(|error| LibraryError::from_sql(&error))?;
         query_summary(&connection)
     }
 
@@ -349,6 +479,9 @@ struct ImportedEpisode {
     imdb_id: Option<String>,
     season: u32,
     episode: u32,
+    title: Option<String>,
+    year: Option<u16>,
+    poster_url: Option<String>,
     watched_at_ms: Option<i64>,
 }
 
@@ -378,6 +511,8 @@ fn migrate(connection: &Connection) -> Result<(), LibraryError> {
                  poster_url TEXT,
                  favorite INTEGER NOT NULL DEFAULT 0 CHECK (favorite IN (0, 1)),
                  watched INTEGER NOT NULL DEFAULT 0 CHECK (watched IN (0, 1)),
+                 continue_watching_hidden INTEGER NOT NULL DEFAULT 0
+                     CHECK (continue_watching_hidden IN (0, 1)),
                  watched_at_ms INTEGER,
                  progress_seconds INTEGER,
                  imported_from TEXT NOT NULL,
@@ -399,6 +534,24 @@ fn migrate(connection: &Connection) -> Result<(), LibraryError> {
              COMMIT;",
         )
         .map_err(|error| LibraryError::from_sql(&error))?;
+    if column_exists(connection, "media_state", "continue_watching_hidden")? {
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO schema_migrations(version) VALUES (3)",
+                [],
+            )
+            .map_err(|error| LibraryError::from_sql(&error))?;
+    } else {
+        connection
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE media_state ADD COLUMN continue_watching_hidden INTEGER NOT NULL
+                     DEFAULT 0 CHECK (continue_watching_hidden IN (0, 1));
+                 INSERT OR IGNORE INTO schema_migrations(version) VALUES (3);
+                 COMMIT;",
+            )
+            .map_err(|error| LibraryError::from_sql(&error))?;
+    }
     let version: i64 = connection
         .query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -412,6 +565,21 @@ fn migrate(connection: &Connection) -> Result<(), LibraryError> {
         )));
     }
     Ok(())
+}
+
+fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool, LibraryError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| LibraryError::from_sql(&error))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| LibraryError::from_sql(&error))?;
+    for candidate in columns {
+        if candidate.map_err(|error| LibraryError::from_sql(&error))? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn upsert_media(
@@ -463,13 +631,16 @@ fn upsert_episode(
         .execute(
             "INSERT INTO media_state (
                  state_key, external_id, media_kind, parent_external_id, season,
-                 episode, watched, watched_at_ms, imported_from
-             ) VALUES (?1, ?2, 'episode', ?3, ?4, ?5, 1, ?6, 'popcorn_time')
+                 episode, title, year, poster_url, watched, watched_at_ms, imported_from
+             ) VALUES (?1, ?2, 'episode', ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, 'popcorn_time')
              ON CONFLICT(state_key) DO UPDATE SET
                  parent_external_id = COALESCE(
                      excluded.parent_external_id,
                      media_state.parent_external_id
                  ),
+                 title = COALESCE(excluded.title, media_state.title),
+                 year = COALESCE(excluded.year, media_state.year),
+                 poster_url = COALESCE(excluded.poster_url, media_state.poster_url),
                  watched = 1,
                  watched_at_ms = CASE
                      WHEN excluded.watched_at_ms IS NULL THEN media_state.watched_at_ms
@@ -483,7 +654,151 @@ fn upsert_episode(
                 item.imdb_id,
                 item.season,
                 item.episode,
+                item.title,
+                item.year,
+                item.poster_url,
                 item.watched_at_ms,
+            ],
+        )
+        .map_err(|error| LibraryError::from_sql(&error))?;
+    Ok(())
+}
+
+fn set_movie_watched(
+    transaction: &Transaction<'_>,
+    item: &LibraryItem,
+    watched: bool,
+) -> Result<(), LibraryError> {
+    let external_id = canonical_external_id(&item.external_id);
+    let updated = transaction
+        .execute(
+            "UPDATE media_state
+             SET title = COALESCE(?2, title), year = COALESCE(?3, year),
+                 poster_url = COALESCE(?4, poster_url), watched = ?5,
+                 watched_at_ms = CASE
+                     WHEN ?5 = 1 THEN CAST(strftime('%s', 'now') AS INTEGER) * 1000
+                     ELSE NULL
+                 END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE media_kind = 'movie' AND external_id = ?1 COLLATE NOCASE",
+            params![external_id, item.title, item.year, item.poster_url, watched],
+        )
+        .map_err(|error| LibraryError::from_sql(&error))?;
+    if updated == 0 {
+        transaction
+            .execute(
+                "INSERT INTO media_state (
+                     state_key, external_id, media_kind, title, year, poster_url,
+                     watched, watched_at_ms, imported_from
+                 ) VALUES (
+                     ?1, ?2, 'movie', ?3, ?4, ?5, ?6,
+                     CASE WHEN ?6 = 1 THEN CAST(strftime('%s', 'now') AS INTEGER) * 1000 END,
+                     'redcrown'
+                 )",
+                params![
+                    media_state_key(LibraryMediaKind::Movie, &external_id),
+                    external_id,
+                    item.title,
+                    item.year,
+                    item.poster_url,
+                    watched,
+                ],
+            )
+            .map_err(|error| LibraryError::from_sql(&error))?;
+    }
+    Ok(())
+}
+
+fn set_series_watched(
+    transaction: &Transaction<'_>,
+    item: &LibraryItem,
+    episodes: &[LibraryEpisode],
+    watched: bool,
+) -> Result<(), LibraryError> {
+    let external_id = canonical_external_id(&item.external_id);
+    for episode in episodes {
+        let updated = transaction
+            .execute(
+                "UPDATE media_state
+                 SET title = COALESCE(?4, title), year = COALESCE(?5, year),
+                     poster_url = COALESCE(?6, poster_url), watched = ?7,
+                     watched_at_ms = CASE
+                         WHEN ?7 = 1 THEN CAST(strftime('%s', 'now') AS INTEGER) * 1000
+                         ELSE NULL
+                     END,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE media_kind = 'episode'
+                   AND parent_external_id = ?1 COLLATE NOCASE
+                   AND season = ?2 AND episode = ?3",
+                params![
+                    external_id,
+                    episode.season,
+                    episode.episode,
+                    item.title,
+                    item.year,
+                    item.poster_url,
+                    watched,
+                ],
+            )
+            .map_err(|error| LibraryError::from_sql(&error))?;
+        if updated == 0 && watched {
+            let state_key = format!(
+                "{}:s{}:e{}",
+                media_state_key(LibraryMediaKind::Series, &external_id),
+                episode.season,
+                episode.episode
+            );
+            transaction
+                .execute(
+                    "INSERT INTO media_state (
+                         state_key, external_id, media_kind, parent_external_id,
+                         season, episode, title, year, poster_url, watched,
+                         watched_at_ms, imported_from
+                     ) VALUES (
+                         ?1, ?2, 'episode', ?2, ?3, ?4, ?5, ?6, ?7, 1,
+                         CAST(strftime('%s', 'now') AS INTEGER) * 1000, 'redcrown'
+                     )",
+                    params![
+                        state_key,
+                        external_id,
+                        episode.season,
+                        episode.episode,
+                        item.title,
+                        item.year,
+                        item.poster_url,
+                    ],
+                )
+                .map_err(|error| LibraryError::from_sql(&error))?;
+        }
+    }
+    Ok(())
+}
+
+fn set_continue_watching_hidden(
+    transaction: &Transaction<'_>,
+    item: &LibraryItem,
+    hidden: bool,
+) -> Result<(), LibraryError> {
+    let external_id = canonical_external_id(&item.external_id);
+    transaction
+        .execute(
+            "INSERT INTO media_state (
+                 state_key, external_id, media_kind, title, year, poster_url,
+                 continue_watching_hidden, imported_from
+             ) VALUES (?1, ?2, 'series', ?3, ?4, ?5, ?6, 'redcrown')
+             ON CONFLICT(state_key) DO UPDATE SET
+                 title = COALESCE(excluded.title, media_state.title),
+                 year = COALESCE(excluded.year, media_state.year),
+                 poster_url = COALESCE(excluded.poster_url, media_state.poster_url),
+                 continue_watching_hidden = excluded.continue_watching_hidden,
+                 updated_at = CURRENT_TIMESTAMP",
+            params![
+                media_state_key(LibraryMediaKind::Series, &external_id),
+                external_id,
+                item.title,
+                item.year,
+                item.poster_url,
+                hidden,
             ],
         )
         .map_err(|error| LibraryError::from_sql(&error))?;
@@ -510,13 +825,93 @@ fn query_summary(connection: &Connection) -> Result<LibrarySummary, LibraryError
     let watched_episode_count = count_where(connection, "watched = 1 AND media_kind = 'episode'")?;
     let favorites = query_media_items(connection, "favorite = 1 AND media_kind != 'episode'")?;
     let watched_movies = query_media_items(connection, "watched = 1 AND media_kind = 'movie'")?;
+    let watched_series = query_watched_series(connection)?;
+    let continue_watching_hidden = query_hidden_continue_series(connection)?;
     Ok(LibrarySummary {
         favorite_count,
         watched_movie_count,
         watched_episode_count,
         favorites,
         watched_movies,
+        watched_series,
+        continue_watching_hidden,
     })
+}
+
+fn query_hidden_continue_series(connection: &Connection) -> Result<Vec<String>, LibraryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT external_id FROM media_state
+             WHERE media_kind = 'series' AND continue_watching_hidden = 1
+             ORDER BY external_id COLLATE NOCASE",
+        )
+        .map_err(|error| LibraryError::from_sql(&error))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| LibraryError::from_sql(&error))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| LibraryError::from_sql(&error))
+}
+
+fn query_watched_series(connection: &Connection) -> Result<Vec<WatchedSeries>, LibraryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT parent_external_id, title, year, poster_url, season, episode, watched_at_ms
+             FROM media_state
+             WHERE watched = 1 AND media_kind = 'episode'
+               AND parent_external_id IS NOT NULL AND season > 0 AND episode > 0
+             ORDER BY parent_external_id COLLATE NOCASE, season, episode",
+        )
+        .map_err(|error| LibraryError::from_sql(&error))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<u16>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, u32>(4)?,
+                row.get::<_, u32>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })
+        .map_err(|error| LibraryError::from_sql(&error))?;
+    let mut grouped: HashMap<String, WatchedSeries> = HashMap::new();
+    for row in rows {
+        let (external_id, title, year, poster_url, season, episode, watched_at_ms) =
+            row.map_err(|error| LibraryError::from_sql(&error))?;
+        let key = canonical_external_id(&external_id);
+        let entry = grouped.entry(key.clone()).or_insert_with(|| WatchedSeries {
+            external_id: key,
+            title: None,
+            year: None,
+            poster_url: None,
+            latest_season: season,
+            latest_episode: episode,
+            watched_at_ms: None,
+            episodes: Vec::new(),
+        });
+        entry.title = title.or(entry.title.take());
+        entry.year = year.or(entry.year);
+        entry.poster_url = poster_url.or(entry.poster_url.take());
+        if (season, episode) > (entry.latest_season, entry.latest_episode) {
+            entry.latest_season = season;
+            entry.latest_episode = episode;
+        }
+        entry.watched_at_ms = newest_timestamp(entry.watched_at_ms, watched_at_ms);
+        let episode = LibraryEpisode { season, episode };
+        if !entry.episodes.contains(&episode) {
+            entry.episodes.push(episode);
+        }
+    }
+    let mut series: Vec<_> = grouped.into_values().collect();
+    series.sort_by(|left, right| {
+        right
+            .watched_at_ms
+            .cmp(&left.watched_at_ms)
+            .then_with(|| left.external_id.cmp(&right.external_id))
+    });
+    Ok(series)
 }
 
 fn query_media_items(
@@ -567,6 +962,8 @@ const fn empty_summary() -> LibrarySummary {
         watched_episode_count: 0,
         favorites: Vec::new(),
         watched_movies: Vec::new(),
+        watched_series: Vec::new(),
+        continue_watching_hidden: Vec::new(),
     }
 }
 
@@ -580,7 +977,7 @@ fn parse_profile(id: &str, label: &str, data_path: &Path) -> Result<PopcornProfi
     let metadata = read_media_metadata(data_path)?;
     let (favorites, favorite_skipped) = read_favorites(&data_path.join("bookmarks.db"), &metadata)?;
     let (watched_movies, watched_episodes, watched_skipped) =
-        read_watched(&data_path.join("watched.db"))?;
+        read_watched(&data_path.join("watched.db"), &metadata)?;
     let api_urls = extract_api_urls(&settings);
     let playback_progress = extract_progress(&settings, &favorites, &watched_movies);
     let version = settings
@@ -727,6 +1124,7 @@ fn read_favorites(
 
 fn read_watched(
     path: &Path,
+    metadata: &HashMap<String, ImportedMetadata>,
 ) -> Result<(Vec<ImportedMedia>, Vec<ImportedEpisode>, usize), LibraryError> {
     let mut movies: HashMap<String, ImportedMedia> = HashMap::new();
     let mut episodes: HashMap<String, ImportedEpisode> = HashMap::new();
@@ -775,14 +1173,23 @@ fn read_watched(
                 }
                 let key = format!("tvdb:{tvdb_id}:s{season}:e{episode}");
                 let watched_at_ms = nedb_date_ms(row.get("date"));
+                let imdb_id = row.get("imdb_id").and_then(value_string);
+                let cached = imdb_id
+                    .as_ref()
+                    .and_then(|external_id| metadata.get(external_id))
+                    .cloned()
+                    .unwrap_or_default();
                 let entry = episodes
                     .entry(key.clone())
                     .or_insert_with(|| ImportedEpisode {
                         key,
                         tvdb_id,
-                        imdb_id: row.get("imdb_id").and_then(value_string),
+                        imdb_id,
                         season,
                         episode,
+                        title: cached.title,
+                        year: cached.year,
+                        poster_url: cached.poster_url,
                         watched_at_ms,
                     });
                 entry.watched_at_ms = newest_timestamp(entry.watched_at_ms, watched_at_ms);
@@ -976,7 +1383,93 @@ fn valid_external_id(value: &str) -> bool {
     (3..=64).contains(&length)
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.'))
+}
+
+fn canonical_external_id(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn media_state_key(kind: LibraryMediaKind, external_id: &str) -> String {
+    if external_id.starts_with("tt") {
+        format!("imdb:{external_id}")
+    } else {
+        format!("catalog:{}:{external_id}", kind.as_str())
+    }
+}
+
+fn validate_library_item(item: &LibraryItem) -> Result<(), LibraryError> {
+    if !valid_external_id(item.external_id.trim()) {
+        return Err(LibraryError::new("library item identifier is invalid"));
+    }
+    if item.title.as_deref().is_some_and(|title| {
+        title.trim().is_empty() || title.chars().count() > MAX_LIBRARY_TITLE_CHARS
+    }) {
+        return Err(LibraryError::new("library item title is invalid"));
+    }
+    if let Some(poster_url) = item.poster_url.as_deref() {
+        let url = Url::parse(poster_url)
+            .map_err(|_| LibraryError::new("library poster URL is invalid"))?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(LibraryError::new("library poster URL is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_watched_selection(
+    kind: LibraryMediaKind,
+    episodes: &[LibraryEpisode],
+) -> Result<(), LibraryError> {
+    if kind == LibraryMediaKind::Movie && !episodes.is_empty() {
+        return Err(LibraryError::new(
+            "movie watched state cannot contain episodes",
+        ));
+    }
+    if kind == LibraryMediaKind::Series && episodes.len() != 1 {
+        return Err(LibraryError::new(
+            "series watched state requires exactly one selected regular episode",
+        ));
+    }
+    let mut unique = HashSet::with_capacity(episodes.len());
+    for episode in episodes {
+        if episode.season == 0 || episode.episode == 0 {
+            return Err(LibraryError::new(
+                "series watched state contains an invalid regular episode",
+            ));
+        }
+        if !unique.insert(*episode) {
+            return Err(LibraryError::new(
+                "series watched state contains a duplicate episode",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_episode_snapshot(episodes: &[LibraryEpisode]) -> Result<(), LibraryError> {
+    if episodes.is_empty() {
+        return Err(LibraryError::new(
+            "series watched snapshot requires at least one regular episode",
+        ));
+    }
+    let mut unique = HashSet::with_capacity(episodes.len());
+    for episode in episodes {
+        if episode.season == 0 || episode.episode == 0 {
+            return Err(LibraryError::new(
+                "series watched snapshot contains an invalid regular episode",
+            ));
+        }
+        if !unique.insert(*episode) {
+            return Err(LibraryError::new(
+                "series watched snapshot contains a duplicate episode",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn normalize_poster_url(value: &str) -> Option<String> {
@@ -1041,7 +1534,10 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{Library, PopcornImportSelection, parse_profile, read_nedb};
+    use super::{
+        Library, LibraryEpisode, LibraryItem, LibraryMediaKind, PopcornImportSelection,
+        parse_profile, read_nedb,
+    };
 
     #[test]
     fn nedb_replays_updates_and_tombstones() {
@@ -1089,7 +1585,11 @@ mod tests {
         )
         .expect("watched");
         fs::write(profile.join("movies.db"), "").expect("movies");
-        fs::write(profile.join("shows.db"), "").expect("shows");
+        fs::write(
+            profile.join("shows.db"),
+            "{\"_id\":\"show\",\"imdb_id\":\"tt456\",\"title\":\"Example Show\",\"year\":2025,\"images\":{\"poster\":\"https://image.tmdb.org/t/p/w500/show.jpg\"}}\n",
+        )
+        .expect("shows");
 
         let parsed = parse_profile("test", "Test", &profile).expect("profile");
         assert_eq!(parsed.preview().api_urls.len(), 2);
@@ -1105,6 +1605,129 @@ mod tests {
         assert_eq!(second.library.watched_episode_count, 1);
         assert_eq!(second.library.watched_movies.len(), 1);
         assert_eq!(second.library.watched_movies[0].external_id, "tt123");
+        assert_eq!(second.library.watched_series.len(), 1);
+        assert_eq!(second.library.watched_series[0].external_id, "tt456");
+        assert_eq!(
+            second.library.watched_series[0].title.as_deref(),
+            Some("Example Show")
+        );
+        assert_eq!(second.library.watched_series[0].latest_episode, 2);
+    }
+
+    #[test]
+    fn manual_watched_state_is_reversible_and_preserves_series_frontier() {
+        let directory = tempdir().expect("directory");
+        let library = Library::open(directory.path().join("library.sqlite3")).expect("library");
+        let movie = LibraryItem {
+            external_id: "TT-MOVIE".to_owned(),
+            kind: LibraryMediaKind::Movie,
+            title: Some("Movie".to_owned()),
+            year: Some(2026),
+            poster_url: None,
+        };
+        let watched = library.set_watched(&movie, &[], true).expect("watch movie");
+        assert_eq!(watched.watched_movie_count, 1);
+        assert_eq!(watched.watched_movies[0].external_id, "tt-movie");
+        let unwatched = library
+            .set_watched(&movie, &[], false)
+            .expect("unwatch movie");
+        assert_eq!(unwatched.watched_movie_count, 0);
+
+        let series = LibraryItem {
+            external_id: "TT-SERIES".to_owned(),
+            kind: LibraryMediaKind::Series,
+            title: Some("Series".to_owned()),
+            year: Some(2025),
+            poster_url: None,
+        };
+        let first = LibraryEpisode {
+            season: 1,
+            episode: 1,
+        };
+        let selected = LibraryEpisode {
+            season: 2,
+            episode: 1,
+        };
+        library
+            .set_watched(&series, &[first], true)
+            .expect("watch first episode");
+        let watched = library
+            .set_watched(&series, &[selected], true)
+            .expect("watch selected episode");
+        assert_eq!(watched.watched_episode_count, 2);
+        assert_eq!(watched.watched_series[0].latest_season, 2);
+        assert_eq!(watched.watched_series[0].latest_episode, 1);
+        assert_eq!(watched.watched_series[0].episodes, vec![first, selected]);
+
+        let unwatched = library
+            .set_watched(&series, &[selected], false)
+            .expect("unwatch selected episode");
+        assert_eq!(unwatched.watched_episode_count, 1);
+        assert_eq!(unwatched.watched_series[0].latest_season, 1);
+        assert_eq!(unwatched.watched_series[0].latest_episode, 1);
+        assert_eq!(unwatched.watched_series[0].episodes, vec![first]);
+    }
+
+    #[test]
+    fn continue_watching_suppression_is_independent_and_reenabled_by_episode_activity() {
+        let directory = tempdir().expect("directory");
+        let library = Library::open(directory.path().join("library.sqlite3")).expect("library");
+        let series = LibraryItem {
+            external_id: "TT-SERIES".to_owned(),
+            kind: LibraryMediaKind::Series,
+            title: Some("Series".to_owned()),
+            year: Some(2025),
+            poster_url: None,
+        };
+        let episode = LibraryEpisode {
+            season: 1,
+            episode: 1,
+        };
+        library
+            .set_watched(&series, &[episode], true)
+            .expect("watch episode");
+
+        let hidden = library
+            .set_continue_watching_hidden(&series, true)
+            .expect("hide continuation");
+        assert_eq!(hidden.continue_watching_hidden, vec!["tt-series"]);
+        assert_eq!(hidden.watched_episode_count, 1);
+
+        let restored = library
+            .set_watched(&series, &[episode], true)
+            .expect("repeat episode activity");
+        assert!(restored.continue_watching_hidden.is_empty());
+        assert_eq!(restored.watched_episode_count, 1);
+    }
+
+    #[test]
+    fn title_level_series_action_marks_snapshot_without_weakening_granular_updates() {
+        let directory = tempdir().expect("directory");
+        let library = Library::open(directory.path().join("library.sqlite3")).expect("library");
+        let series = LibraryItem {
+            external_id: "TT-SERIES".to_owned(),
+            kind: LibraryMediaKind::Series,
+            title: Some("Series".to_owned()),
+            year: None,
+            poster_url: None,
+        };
+        let episodes = [
+            LibraryEpisode {
+                season: 1,
+                episode: 1,
+            },
+            LibraryEpisode {
+                season: 1,
+                episode: 2,
+            },
+        ];
+
+        assert!(library.set_watched(&series, &episodes, true).is_err());
+        let watched = library
+            .mark_series_watched(&series, &episodes)
+            .expect("mark known series snapshot");
+        assert_eq!(watched.watched_episode_count, 2);
+        assert_eq!(watched.watched_series[0].episodes, episodes);
     }
 
     #[test]
@@ -1153,5 +1776,6 @@ mod tests {
             summary.favorites[0].poster_url.as_deref(),
             Some("https://image.tmdb.org/t/p/w500/poster.jpg")
         );
+        assert!(summary.continue_watching_hidden.is_empty());
     }
 }

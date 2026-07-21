@@ -41,6 +41,10 @@ jobs:
           if ('${{ github.ref_name }}' -ne "v$packageVersion") {
             throw "Tag ${{ github.ref_name }} does not match package version $packageVersion."
           }
+          $releaseNotes = "./docs/releases/${{ github.ref_name }}.md"
+          if (-not (Test-Path -LiteralPath $releaseNotes -PathType Leaf)) {
+            throw "Reviewed release notes are missing: $releaseNotes"
+          }
 
       - name: Install Rust toolchain
         shell: pwsh
@@ -75,5 +79,5 @@ jobs:
           gh release create '${{ github.ref_name }}' $assets `
             --verify-tag `
             --prerelease `
-            --generate-notes `
+            --notes-file "./docs/releases/${{ github.ref_name }}.md" `
             --title "RedCrown ${{ github.ref_name }}"

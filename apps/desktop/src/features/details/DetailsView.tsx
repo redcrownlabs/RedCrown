@@ -1,22 +1,41 @@
 import { useEffect, useId, useState } from "react";
 import type { CSSProperties } from "react";
-import type { MediaEpisode, MediaItem, TorrentOption } from "../../shared/contract.generated";
+import type {
+  LibraryEpisode,
+  LibrarySummary,
+  MediaEpisode,
+  MediaItem,
+  TorrentOption,
+} from "../../shared/contract.generated";
 import { formatBytes } from "../playback/playback-model";
+import {
+  episodeIsWatched,
+  movieIsWatched,
+} from "../home/home-model";
 import { invoke, messageOf } from "../../shared/ipc";
 import { Icon } from "../../shared/ui/Icon";
 import { PosterImage } from "../../shared/ui/PosterImage";
 import { kindLabel } from "../catalog/catalog-utils";
+import { actionItemFromMedia, type MediaContextRequest } from "../library/media-actions";
 
 export function DetailsView({
   item,
   busy,
+  initialEpisode,
+  library,
   onBack,
+  onLibraryChanged,
   onWatch,
+  onContext,
 }: {
   item: MediaItem;
   busy: boolean;
+  initialEpisode?: LibraryEpisode;
+  library?: LibrarySummary;
   onBack: () => void;
+  onLibraryChanged: (library: LibrarySummary) => void;
   onWatch: (source: TorrentOption) => void;
+  onContext: (request: MediaContextRequest) => void;
 }) {
   const movieSources = sortTorrents(item.torrents);
   const [episodes, setEpisodes] = useState<MediaEpisode[]>([]);
@@ -29,6 +48,10 @@ export function DetailsView({
   const [selectedSource, setSelectedSource] = useState(
     movieSources[0] ? torrentKey(movieSources[0]) : undefined,
   );
+  const [savingWatched, setSavingWatched] = useState(false);
+  const [watchedError, setWatchedError] = useState<string>();
+  const initialSeason = initialEpisode?.season;
+  const initialEpisodeNumber = initialEpisode?.episode;
 
   useEffect(() => {
     if (item.kind === "movie") return;
@@ -37,7 +60,14 @@ export function DetailsView({
       .then((result) => {
         if (!active) return;
         setEpisodes(result);
-        const first = result.find((episode) => episode.torrents.length > 0) ?? result[0];
+        const requested = initialSeason != null && initialEpisodeNumber != null
+          ? result.find((episode) =>
+              episode.season === initialSeason
+              && episode.episode === initialEpisodeNumber)
+          : undefined;
+        const first = requested
+          ?? result.find((episode) => episode.torrents.length > 0)
+          ?? result[0];
         setSelectedSeason(first?.season);
         setSelectedEpisodeKey(first ? episodeKey(first) : undefined);
         const firstSource = first ? sortTorrents(first.torrents)[0] : undefined;
@@ -52,7 +82,7 @@ export function DetailsView({
     return () => {
       active = false;
     };
-  }, [item.id, item.kind]);
+  }, [initialEpisodeNumber, initialSeason, item.id, item.kind]);
 
   const seasons = [...new Set(episodes.map((episode) => episode.season))];
   const seasonEpisodes = episodes.filter((episode) => episode.season === selectedSeason);
@@ -61,6 +91,13 @@ export function DetailsView({
     ? movieSources
     : sortTorrents(selectedEpisode?.torrents ?? []);
   const selectedTorrent = sources.find((source) => torrentKey(source) === selectedSource);
+  const watched = item.kind === "movie"
+    ? movieIsWatched(item, library?.watched_movies ?? [])
+    : selectedEpisode != null && episodeIsWatched(
+      item,
+      selectedEpisode,
+      library?.watched_series ?? [],
+    );
 
   function selectEpisode(episode: MediaEpisode) {
     setSelectedEpisodeKey(episodeKey(episode));
@@ -75,6 +112,33 @@ export function DetailsView({
     if (first) selectEpisode(first);
   }
 
+  async function toggleWatched() {
+    if (item.kind !== "movie" && !selectedEpisode) return;
+    const episodeSelection = selectedEpisode
+      ? [{ season: selectedEpisode.season, episode: selectedEpisode.episode }]
+      : [];
+    setSavingWatched(true);
+    setWatchedError(undefined);
+    try {
+      const summary = await invoke<LibrarySummary>("library.set_watched", {
+        item: {
+          external_id: item.id,
+          kind: item.kind === "movie" ? "movie" : "series",
+          title: item.title,
+          year: item.year,
+          poster_url: item.poster_url,
+        },
+        episodes: item.kind === "movie" ? [] : episodeSelection,
+        watched: !watched,
+      });
+      onLibraryChanged(summary);
+    } catch (reason) {
+      setWatchedError(messageOf(reason));
+    } finally {
+      setSavingWatched(false);
+    }
+  }
+
   return (
     <article
       className="details-view"
@@ -85,14 +149,35 @@ export function DetailsView({
       <div className="details-shade">
         <button className="back-button" onClick={onBack}><Icon name="back" />Back</button>
         <div className="details-layout">
-        <div className="details-poster">
+        <div
+          className="details-poster"
+          onContextMenu={(event) => {
+            event.preventDefault();
+            onContext({
+              item: actionItemFromMedia(item),
+              x: event.clientX,
+              y: event.clientY,
+              continuation: false,
+            });
+          }}
+        >
           {item.poster_url ? (
             <PosterImage src={item.poster_url} fallback={item.title[0]} loading="eager" fetchPriority="high" />
           ) : item.title[0]}
         </div>
         <div className="details-copy">
           <p className="eyebrow">{kindLabel(item.kind)}</p>
-          <h1>{item.title}</h1>
+          <h1
+            onContextMenu={(event) => {
+              event.preventDefault();
+              onContext({
+                item: actionItemFromMedia(item),
+                x: event.clientX,
+                y: event.clientY,
+                continuation: false,
+              });
+            }}
+          >{item.title}</h1>
           <div className="metadata">
             <span>{item.year ?? "Year unknown"}</span>
             {item.rating != null && <span>{item.rating.toFixed(1)} / 10</span>}
@@ -156,14 +241,29 @@ export function DetailsView({
               )}
             </section>
           )}
-          <button
-            className="primary-button"
-            disabled={!selectedTorrent || busy}
-            onClick={() => selectedTorrent && onWatch(selectedTorrent)}
-          >
-            <Icon name="play" />
-            {busy ? "Preparing…" : "Watch now"}
-          </button>
+          <div className="details-actions">
+            <button
+              className="primary-button"
+              disabled={!selectedTorrent || busy}
+              onClick={() => selectedTorrent && onWatch(selectedTorrent)}
+            >
+              <Icon name="play" />
+              {busy ? "Preparing…" : "Watch now"}
+            </button>
+            <button
+              className="secondary-button"
+              disabled={savingWatched || (item.kind !== "movie" && !selectedEpisode)}
+              aria-pressed={watched}
+              onClick={() => void toggleWatched()}
+            >
+              {savingWatched
+                ? "Saving…"
+                : item.kind === "movie"
+                  ? watched ? "Watched · Undo" : "Mark as watched"
+                  : watched ? "Episode watched · Undo" : "Mark episode watched"}
+            </button>
+          </div>
+          {watchedError && <p className="supporting-note error-note" role="alert">{watchedError}</p>}
           {episodeStatus !== "loading" && !selectedTorrent && (
             <p className="supporting-note">
               {item.kind === "movie"

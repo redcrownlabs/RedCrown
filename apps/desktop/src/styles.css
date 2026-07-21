@@ -175,6 +175,7 @@
   .landscape-card strong, .media-card strong { @apply mt-2.5 block overflow-hidden text-ellipsis whitespace-nowrap; }
   .landscape-card > span, .media-card > span { @apply mt-1.5 block text-xs text-muted; }
   .rating-badge { @apply absolute top-2 right-2 rounded-md bg-black/75 px-2 py-1 text-xs font-black text-amber-300 backdrop-blur; }
+  .continue-badge { @apply absolute right-2 bottom-2 rounded-md bg-brand/90 px-2 py-1 text-xs font-black text-white shadow-lg backdrop-blur; }
   .card-play { @apply absolute top-1/2 left-1/2 grid size-11 -translate-x-1/2 -translate-y-[35%] scale-80 place-items-center rounded-full border border-white/45 bg-black/60 opacity-0 transition duration-150; }
   .landscape-card:hover .card-play { @apply -translate-y-1/2 scale-100 opacity-100; }
   .poster-fallback { @apply grid h-full place-items-center bg-panel-soft text-6xl font-black text-brand; background-image: radial-gradient(circle at 30% 20%, #2c2630, #151820); }
@@ -259,7 +260,9 @@
   .torrent-options small { @apply text-xs text-muted; }
   .torrent-filename { @apply pointer-events-none absolute bottom-[calc(100%+0.625rem)] left-1/2 z-30 hidden w-max max-w-[min(32rem,70vw)] -translate-x-1/2 rounded-lg border border-white/10 bg-black/95 px-3 py-2 text-center text-xs leading-relaxed break-words text-gray-200 opacity-0 shadow-2xl; }
   .torrent-option:hover .torrent-filename, .torrent-option:focus-within .torrent-filename { @apply block opacity-100; }
-  .details-copy > .primary-button { @apply mt-0 w-fit; }
+  .details-actions { @apply flex flex-wrap gap-3; }
+  .details-actions .primary-button, .details-actions .secondary-button { @apply mt-0 w-fit; }
+  .details-actions .secondary-button[aria-pressed="true"] { @apply border-brand/55 bg-brand/12 text-copy; }
   .supporting-note { @apply mt-4 text-muted; }
   .error-note { @apply text-red-300; }
 
@@ -285,10 +288,12 @@
   }
   .redcrown-player-stage.controls-visible .player-cinematic-shade { @apply opacity-100; }
   .player-topbar {
-    @apply pointer-events-none absolute inset-x-0 top-0 z-3 flex translate-y-[-.75rem] items-start gap-4 px-[clamp(1.1rem,3vw,2.5rem)] pt-[clamp(1rem,2.5vw,2rem)] opacity-0 transition duration-300;
+    @apply pointer-events-none absolute inset-x-0 top-0 flex translate-y-[-.75rem] items-start gap-4 px-[clamp(1.1rem,3vw,2.5rem)] pt-[clamp(1rem,2.5vw,2rem)] opacity-0 transition duration-300;
+    z-index: 60;
   }
   .redcrown-player-stage.controls-visible .player-topbar { @apply translate-y-0 opacity-100; }
   .player-topbar button, .player-topbar .player-network { @apply pointer-events-auto; }
+  .player-topbar button { -webkit-app-region: no-drag; }
   .player-icon-button {
     @apply grid size-11 shrink-0 place-items-center rounded-full border-0 bg-transparent p-0 text-white transition hover:bg-white/14 focus-visible:bg-white/14;
   }
@@ -349,8 +354,11 @@
     backdrop-filter: blur(18px);
   }
   .playback-dismiss {
-    @apply absolute top-5 left-[clamp(1.25rem,3vw,2.5rem)] z-10 inline-flex min-h-10 items-center gap-2 rounded-lg border-0 bg-transparent px-2 text-sm font-semibold text-gray-300 transition hover:bg-white/8 hover:text-copy;
+    @apply absolute top-5 left-[clamp(1.25rem,3vw,2.5rem)] inline-flex min-h-10 items-center gap-2 rounded-lg border-0 bg-transparent px-2 text-sm font-semibold text-gray-300 transition hover:bg-white/8 hover:text-copy;
+    z-index: 60;
+    -webkit-app-region: no-drag;
   }
+  .playback-dismiss > * { @apply pointer-events-none; }
   .playback-dismiss svg { @apply size-4; }
   .playback-focus {
     @apply grid w-[min(26rem,100%)] justify-items-center gap-10 text-center;
@@ -504,6 +512,15 @@
   .migration-empty { @apply grid gap-1.5 py-8 text-muted; }
   .migration-empty p { @apply text-copy; }
   .migration-empty span { @apply text-xs; }
+  .context-action-popover {
+    @apply fixed m-0 w-64 rounded-xl border border-line bg-panel p-1.5 text-copy shadow-feature;
+    inset: auto;
+  }
+  .context-action-popover::backdrop { background: transparent; }
+  .context-action-popover > p { @apply overflow-hidden text-ellipsis whitespace-nowrap px-3 py-2 text-xs font-bold text-muted; }
+  .context-action-list { @apply grid gap-0.5; }
+  .context-action-list button { @apply min-h-10 rounded-lg border-0 bg-transparent px-3 text-left text-sm font-semibold text-copy hover:bg-panel-soft disabled:cursor-wait disabled:opacity-60; }
+  .context-action-list button.danger { @apply text-danger; }
   .sr-only { @apply absolute size-px overflow-hidden whitespace-nowrap p-0; clip-path: inset(50%); margin: -1px; border: 0; }
 }
 

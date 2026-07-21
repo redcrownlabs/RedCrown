@@ -80,6 +80,17 @@ describe("RedCrownPlayer keyboard shortcuts", () => {
     vi.useRealTimers();
   });
 
+  it("closes when the text inside the playback back button is clicked", () => {
+    const onClose = vi.fn();
+    act(() => {
+      root.render(<RedCrownPlayer item={item} status={status} onClose={onClose} />);
+    });
+
+    act(() => container.querySelector<HTMLSpanElement>(".player-back span")?.click());
+
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
   it("coalesces repeated keyboard seeks into one stream restart", () => {
     vi.useFakeTimers();
     const video = container.querySelector("video");

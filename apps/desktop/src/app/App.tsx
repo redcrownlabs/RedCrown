@@ -1,7 +1,13 @@
 import { startTransition, useCallback, useEffect, useState } from "react";
 
-import type { BootstrapState, CatalogPage, CatalogQuery, LibrarySummary, MediaItem, MediaKind, PlaybackStatus, TorrentOption } from "../shared/contract.generated";
-import { visibleHomeItems } from "../features/home/home-model";
+import type { BootstrapState, CatalogPage, CatalogQuery, LibraryEpisode, LibrarySummary, MediaEpisode, MediaItem, MediaKind, PlaybackStatus, TorrentOption } from "../shared/contract.generated";
+import {
+  continueWatchingCandidates,
+  movieIsWatched,
+  nextUnwatchedEpisode,
+  regularEpisodeSnapshot,
+  visibleHomeItems,
+} from "../features/home/home-model";
 import { hasConfiguredCatalog } from "../features/settings/settings-model";
 import { CatalogView } from "../features/catalog/CatalogView";
 import { catalogQuery } from "../features/catalog/catalog-utils";
@@ -10,11 +16,13 @@ import { DiagnosticsView } from "../features/diagnostics/DiagnosticsView";
 import { HomeView } from "../features/home/HomeView";
 import type { HomeSection } from "../features/home/HomeView";
 import { LibraryView } from "../features/library/LibraryView";
+import { canonicalMediaId, toLibraryItem, type MediaContextRequest } from "../features/library/media-actions";
 import { PlayerView } from "../features/playback/PlayerView";
 import { SettingsView } from "../features/settings/SettingsView";
 import { invoke, messageOf } from "../shared/ipc";
 import { Icon } from "../shared/ui/Icon";
 import { WindowControls } from "../shared/ui/WindowControls";
+import { ContextActionPopover, type ContextAction } from "../shared/ui/ContextActionPopover";
 
 type View = "home" | "catalog" | "library" | "settings" | "details" | "player" | "diagnostics";
 
@@ -29,22 +37,31 @@ const HOME_CATALOG_REQUESTS: ReadonlyArray<{ title: string; query: CatalogQuery 
 export function App() {
   const [bootstrap, setBootstrap] = useState<BootstrapState>();
   const [homeSections, setHomeSections] = useState<HomeSection[]>([]);
+  const [continueWatching, setContinueWatching] = useState<HomeSection>();
   const [view, setView] = useState<View>("home");
   const [catalogKind, setCatalogKind] = useState<MediaKind>("movie");
   const [detailsReturnView, setDetailsReturnView] = useState<View>("home");
+  const [detailsEpisode, setDetailsEpisode] = useState<LibraryEpisode>();
   const [selected, setSelected] = useState<MediaItem>();
   const [playback, setPlayback] = useState<PlaybackStatus>();
   const [library, setLibrary] = useState<LibrarySummary>();
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(true);
+  const [mediaContext, setMediaContext] = useState<MediaContextRequest>();
   const watchedMovies = library?.watched_movies ?? [];
-  const visibleHomeSections = homeSections
+  const hideWatchedMovies = bootstrap?.settings.hide_watched_movies ?? true;
+  const visibleHomeSections = [continueWatching, ...homeSections]
+    .filter((section): section is HomeSection => section != null)
     .map((section) => ({
       ...section,
-      items: visibleHomeItems(section.items, watchedMovies),
+      items: visibleHomeItems(section.items, watchedMovies, hideWatchedMovies),
     }))
     .filter((section) => section.items.length > 0);
-  const visibleFeatured = visibleHomeItems(bootstrap?.featured ?? [], watchedMovies);
+  const visibleFeatured = visibleHomeItems(
+    bootstrap?.featured ?? [],
+    watchedMovies,
+    hideWatchedMovies,
+  );
 
   const refreshHome = useCallback(async () => {
     const results = await Promise.allSettled(
@@ -69,6 +86,56 @@ export function App() {
     setError(undefined);
     return true;
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    const watchedSeries = library?.watched_series ?? [];
+    const catalogItems = homeSections.flatMap((section) => section.items);
+    const candidates = continueWatchingCandidates(
+      catalogItems,
+      watchedSeries,
+      library?.favorites ?? [],
+      library?.continue_watching_hidden ?? [],
+    );
+    if (!candidates.length) {
+      setContinueWatching(undefined);
+      return () => {
+        active = false;
+      };
+    }
+    void Promise.all(candidates.map(async ({ item, history }) => {
+      try {
+        const episodes = await invoke<MediaEpisode[]>(
+          "catalog.episodes",
+          { media_id: item.id },
+        );
+        const episode = nextUnwatchedEpisode(episodes, history);
+        return episode ? { item, episode } : undefined;
+      } catch {
+        return undefined;
+      }
+    })).then((resolved) => {
+      if (!active) return;
+      const entries = resolved.filter((entry) => entry != null);
+      if (!entries.length) {
+        setContinueWatching(undefined);
+        return;
+      }
+      setContinueWatching({
+        title: "Continue watching",
+        kind: "series",
+        items: entries.map(({ item }) => item),
+        continuations: Object.fromEntries(entries.map(({ item, episode }) => [
+          mediaKey(item),
+          { season: episode.season, episode: episode.episode },
+        ])),
+        browsable: false,
+      });
+    });
+    return () => {
+      active = false;
+    };
+  }, [homeSections, library]);
 
   useEffect(() => {
     let active = true;
@@ -116,10 +183,92 @@ export function App() {
     navigate("catalog");
   }
 
-  function openDetails(item: MediaItem, from: View) {
+  function openDetails(item: MediaItem, from: View, episode?: LibraryEpisode) {
     setSelected(item);
+    setDetailsEpisode(episode);
     setDetailsReturnView(from);
     navigate("details");
+  }
+
+  async function setMovieWatched(request: MediaContextRequest, watched: boolean) {
+    const summary = await invoke<LibrarySummary>("library.set_watched", {
+      item: toLibraryItem(request.item),
+      episodes: [],
+      watched,
+    });
+    setLibrary(summary);
+    setError(undefined);
+  }
+
+  async function markSeriesWatched(request: MediaContextRequest) {
+    const episodes = await invoke<MediaEpisode[]>("catalog.episodes", {
+      media_id: request.item.id,
+    });
+    const snapshot = regularEpisodeSnapshot(episodes);
+    if (!snapshot.length) {
+      throw new Error("No regular episodes are available to mark as watched.");
+    }
+    const summary = await invoke<LibrarySummary>("library.mark_series_watched", {
+      item: toLibraryItem(request.item),
+      episodes: snapshot,
+    });
+    setLibrary(summary);
+    setError(undefined);
+  }
+
+  async function setContinueHidden(request: MediaContextRequest, hidden: boolean) {
+    const summary = await invoke<LibrarySummary>("library.set_continue_watching_hidden", {
+      item: toLibraryItem(request.item),
+      hidden,
+    });
+    setLibrary(summary);
+    setError(undefined);
+  }
+
+  function runMediaAction(action: () => Promise<void>) {
+    return action().catch((reason: unknown) => setError(messageOf(reason)));
+  }
+
+  function contextActions(request: MediaContextRequest): ContextAction[] {
+    if (request.item.kind === "movie") {
+      const watched = movieIsWatched(
+        {
+          ...request.item,
+          synopsis: "",
+          genres: [],
+          torrents: [],
+        },
+        library?.watched_movies ?? [],
+      );
+      return [{
+        id: "watched",
+        label: watched ? "Mark as unwatched" : "Mark as watched",
+        onSelect: () => runMediaAction(() => setMovieWatched(request, !watched)),
+      }];
+    }
+
+    const hidden = (library?.continue_watching_hidden ?? []).some(
+      (id) => canonicalMediaId(id) === canonicalMediaId(request.item.id),
+    );
+    const actions: ContextAction[] = [{
+      id: "watched",
+      label: "Mark series as watched",
+      onSelect: () => runMediaAction(() => markSeriesWatched(request)),
+    }];
+    if (request.continuation) {
+      actions.push({
+        id: "hide-continue",
+        label: "Remove from Continue Watching",
+        onSelect: () => runMediaAction(() => setContinueHidden(request, true)),
+      });
+    } else if (hidden) {
+      actions.push({
+        id: "restore-continue",
+        label: "Allow in Continue Watching",
+        onSelect: () => runMediaAction(() => setContinueHidden(request, false)),
+      });
+    }
+    return actions;
   }
 
   async function watch(source: TorrentOption) {
@@ -206,8 +355,9 @@ export function App() {
             sections={visibleHomeSections}
             fallback={visibleFeatured}
             busy={busy}
-            onOpen={(item) => openDetails(item, "home")}
+            onOpen={(item, episode) => openDetails(item, "home", episode)}
             onBrowse={openCatalog}
+            onContext={setMediaContext}
           />
         )}
         {view === "catalog" && (
@@ -215,6 +365,9 @@ export function App() {
             initialKind={catalogKind}
             onError={setError}
             onOpen={(item) => openDetails(item, "catalog")}
+            onContext={setMediaContext}
+            watchedMovies={watchedMovies}
+            hideWatchedMovies={hideWatchedMovies}
           />
         )}
         {view === "details" && selected && (
@@ -222,11 +375,15 @@ export function App() {
             key={`${selected.kind}:${selected.id}`}
             item={selected}
             busy={busy}
+            initialEpisode={detailsEpisode}
+            library={library}
             onBack={() => navigate(detailsReturnView)}
+            onLibraryChanged={setLibrary}
             onWatch={(source) => void watch(source)}
+            onContext={setMediaContext}
           />
         )}
-        {view === "library" && <LibraryView library={library} />}
+        {view === "library" && <LibraryView library={library} onContext={setMediaContext} />}
         {view === "settings" && (
           <SettingsView
             initial={bootstrap.settings}
@@ -255,6 +412,19 @@ export function App() {
           />
         )}
       </main>
+      {mediaContext && (
+        <ContextActionPopover
+          title={mediaContext.item.title}
+          x={mediaContext.x}
+          y={mediaContext.y}
+          actions={contextActions(mediaContext)}
+          onClose={() => setMediaContext(undefined)}
+        />
+      )}
     </div>
   );
+}
+
+function mediaKey(item: MediaItem) {
+  return `${item.kind}:${item.id.trim().toLocaleLowerCase("en-US")}`;
 }

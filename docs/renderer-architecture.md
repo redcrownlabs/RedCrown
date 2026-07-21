@@ -41,3 +41,14 @@ one theme and its selectors already form a coherent design layer. Splitting it
 mechanically would add import ordering concerns without establishing meaningful
 style ownership. It should be split only when feature-level style isolation or
 CSS modules are adopted deliberately.
+
+## Electron titlebar interaction
+
+The player keeps the frameless window titlebar as a transparent draggable layer
+so the window controls and window dragging remain available. Electron handles
+`-webkit-app-region: drag` outside normal pointer-event hit testing, so
+`pointer-events: none` alone does not make controls underneath that layer
+interactive. Player controls occupying the titlebar height must therefore sit
+above the titlebar stacking level and declare `-webkit-app-region: no-drag` on
+the actual button. Button children do not receive pointer events; the complete
+visual hitbox belongs to the native button element.

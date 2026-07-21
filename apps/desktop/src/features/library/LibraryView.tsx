@@ -1,7 +1,14 @@
 import type { LibrarySummary } from "../../shared/contract.generated";
 import { PosterImage } from "../../shared/ui/PosterImage";
+import { actionItemFromLibrary, type MediaContextRequest } from "./media-actions";
 
-export function LibraryView({ library }: { library?: LibrarySummary }) {
+export function LibraryView({
+  library,
+  onContext,
+}: {
+  library?: LibrarySummary;
+  onContext: (request: MediaContextRequest) => void;
+}) {
   if (!library) {
     return <div className="empty-state"><p>Loading library…</p></div>;
   }
@@ -23,7 +30,19 @@ export function LibraryView({ library }: { library?: LibrarySummary }) {
         {library.favorites.length ? (
           <div className="poster-grid">
             {library.favorites.map((item) => (
-              <article className="media-card library-card" key={`${item.kind}:${item.external_id}`}>
+              <article
+                className="media-card library-card"
+                key={`${item.kind}:${item.external_id}`}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  onContext({
+                    item: actionItemFromLibrary(item),
+                    x: event.clientX,
+                    y: event.clientY,
+                    continuation: false,
+                  });
+                }}
+              >
                 <div className="poster-frame">
                   {item.poster_url ? (
                     <PosterImage src={item.poster_url} fallback={(item.title ?? item.external_id)[0]} loading="lazy" />

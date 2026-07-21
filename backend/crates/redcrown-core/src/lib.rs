@@ -319,6 +319,9 @@ pub struct AppSettings {
     pub tracker_list: TrackerListConfig,
     /// Preferred interface theme.
     pub theme: ThemePreference,
+    /// Whether watched movies are omitted from discovery surfaces.
+    #[serde(default = "default_hide_watched_movies")]
+    pub hide_watched_movies: bool,
 }
 
 impl AppSettings {
@@ -336,6 +339,7 @@ impl AppSettings {
             stream_cache: StreamCachePolicy::standard(),
             tracker_list: TrackerListConfig::default(),
             theme: ThemePreference::System,
+            hide_watched_movies: true,
         }
     }
 
@@ -355,6 +359,10 @@ impl AppSettings {
         }
         Ok(())
     }
+}
+
+const fn default_hide_watched_movies() -> bool {
+    true
 }
 
 impl Default for AppSettings {
@@ -672,5 +680,6 @@ mod tests {
 
         assert!(settings.tracker_list.enabled);
         assert!(settings.tracker_list.validate().is_ok());
+        assert!(settings.hide_watched_movies);
     }
 }

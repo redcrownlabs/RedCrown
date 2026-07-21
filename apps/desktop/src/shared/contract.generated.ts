@@ -45,6 +45,7 @@ export interface AppSettings {
   stream_cache: StreamCachePolicy;
   tracker_list: TrackerListConfig;
   theme: ThemePreference;
+  hide_watched_movies: boolean;
 }
 
 export interface TorrentOption {
@@ -190,12 +191,30 @@ export interface LibraryItem {
   poster_url?: string;
 }
 
+export interface LibraryEpisode {
+  season: number;
+  episode: number;
+}
+
+export interface WatchedSeries {
+  external_id: string;
+  title?: string;
+  year?: number;
+  poster_url?: string;
+  latest_season: number;
+  latest_episode: number;
+  watched_at_ms?: number;
+  episodes: LibraryEpisode[];
+}
+
 export interface LibrarySummary {
   favorite_count: number;
   watched_movie_count: number;
   watched_episode_count: number;
   favorites: LibraryItem[];
   watched_movies: LibraryItem[];
+  watched_series: WatchedSeries[];
+  continue_watching_hidden: string[];
 }
 
 export interface PopcornProfilePreview {

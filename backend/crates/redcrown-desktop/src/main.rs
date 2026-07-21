@@ -15,8 +15,8 @@ use redcrown_core::{
 };
 use redcrown_diagnostics::Diagnostics;
 use redcrown_library::{
-    Library, LibraryImportReport, PopcornImportSelection, PopcornProfilePreview,
-    discover_popcorn_profiles,
+    Library, LibraryEpisode, LibraryImportReport, LibraryItem, PopcornImportSelection,
+    PopcornProfilePreview, discover_popcorn_profiles,
 };
 use redcrown_torrent::{MediaTools, TorrentEngine};
 use serde::{Deserialize, Serialize};
@@ -209,6 +209,26 @@ struct ImportPopcornParams {
     selection: PopcornImportSelection,
 }
 
+#[derive(Debug, Deserialize)]
+struct SetWatchedParams {
+    item: LibraryItem,
+    #[serde(default)]
+    episodes: Vec<LibraryEpisode>,
+    watched: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct MarkSeriesWatchedParams {
+    item: LibraryItem,
+    episodes: Vec<LibraryEpisode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetContinueWatchingHiddenParams {
+    item: LibraryItem,
+    hidden: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct PopcornImportReport {
     api_urls_added: usize,
@@ -378,6 +398,9 @@ fn telemetry_method(method: &str) -> &'static str {
         "playback.cancel" => "playback.cancel",
         "playback.stop" => "playback.stop",
         "library.summary" => "library.summary",
+        "library.set_watched" => "library.set_watched",
+        "library.mark_series_watched" => "library.mark_series_watched",
+        "library.set_continue_watching_hidden" => "library.set_continue_watching_hidden",
         "migration.popcorn.discover" => "migration.popcorn.discover",
         "migration.popcorn.import" => "migration.popcorn.import",
         _ => "unknown",
@@ -449,6 +472,18 @@ async fn dispatch_method(
         }
         method if method.starts_with("playback.") => dispatch_playback(state, method, params).await,
         "library.summary" => library_summary(state).await,
+        "library.set_watched" => {
+            let params: SetWatchedParams = decode_params(params)?;
+            set_watched(state, params).await
+        }
+        "library.mark_series_watched" => {
+            let params: MarkSeriesWatchedParams = decode_params(params)?;
+            mark_series_watched(state, params).await
+        }
+        "library.set_continue_watching_hidden" => {
+            let params: SetContinueWatchingHiddenParams = decode_params(params)?;
+            set_continue_watching_hidden(state, params).await
+        }
         "migration.popcorn.discover" => discover_popcorn().await,
         "migration.popcorn.import" => {
             let params: ImportPopcornParams = decode_params(params)?;
@@ -543,6 +578,45 @@ async fn library_summary(state: &AppState) -> Result<Value, BackendError> {
         .await
         .map_err(|error| BackendError::new(format!("library task failed: {error}")))?
         .map_err(|error| BackendError::new(error.user_message()))?;
+    serde_json::to_value(summary).map_err(|error| BackendError::serialization(&error))
+}
+
+async fn set_watched(state: &AppState, params: SetWatchedParams) -> Result<Value, BackendError> {
+    let library = Arc::clone(&state.library);
+    let summary = tokio::task::spawn_blocking(move || {
+        library.set_watched(&params.item, &params.episodes, params.watched)
+    })
+    .await
+    .map_err(|error| BackendError::new(format!("library watched task failed: {error}")))?
+    .map_err(|error| BackendError::new(error.user_message()))?;
+    serde_json::to_value(summary).map_err(|error| BackendError::serialization(&error))
+}
+
+async fn mark_series_watched(
+    state: &AppState,
+    params: MarkSeriesWatchedParams,
+) -> Result<Value, BackendError> {
+    let library = Arc::clone(&state.library);
+    let summary = tokio::task::spawn_blocking(move || {
+        library.mark_series_watched(&params.item, &params.episodes)
+    })
+    .await
+    .map_err(|error| BackendError::new(format!("library watched task failed: {error}")))?
+    .map_err(|error| BackendError::new(error.user_message()))?;
+    serde_json::to_value(summary).map_err(|error| BackendError::serialization(&error))
+}
+
+async fn set_continue_watching_hidden(
+    state: &AppState,
+    params: SetContinueWatchingHiddenParams,
+) -> Result<Value, BackendError> {
+    let library = Arc::clone(&state.library);
+    let summary = tokio::task::spawn_blocking(move || {
+        library.set_continue_watching_hidden(&params.item, params.hidden)
+    })
+    .await
+    .map_err(|error| BackendError::new(format!("library Continue Watching task failed: {error}")))?
+    .map_err(|error| BackendError::new(error.user_message()))?;
     serde_json::to_value(summary).map_err(|error| BackendError::serialization(&error))
 }
 

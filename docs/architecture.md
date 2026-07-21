@@ -126,3 +126,6 @@ work remains in Rust.
 
 The renderer's internal feature and dependency boundaries are documented in
 [`renderer-architecture.md`](renderer-architecture.md).
+
+Durable watched snapshots and new-episode discovery are documented in
+[`watched-state.md`](watched-state.md).

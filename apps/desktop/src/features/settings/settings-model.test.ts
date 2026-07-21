@@ -50,6 +50,7 @@ describe("source settings", () => {
         },
       },
       theme: "system" as const,
+      hide_watched_movies: true,
     };
 
     expect(hasConfiguredCatalog(settings)).toBe(false);

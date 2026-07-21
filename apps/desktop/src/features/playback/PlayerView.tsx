@@ -60,7 +60,7 @@ export function PlayerView({
         <div className="playback-shade">
           <button className="playback-dismiss" onClick={onClose} type="button">
             <Icon name="back" />
-            Cancel playback
+            <span>Cancel playback</span>
           </button>
           <div className="playback-focus">
             {item.poster_url ? (

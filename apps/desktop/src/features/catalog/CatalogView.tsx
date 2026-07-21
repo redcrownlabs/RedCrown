@@ -1,18 +1,25 @@
 import { useCallback, useDeferredValue, useEffect, useRef, useState } from "react";
-import type { CatalogPage, CatalogSort, MediaItem, MediaKind } from "../../shared/contract.generated";
+import type { CatalogPage, CatalogSort, LibraryItem, MediaItem, MediaKind } from "../../shared/contract.generated";
 import { invoke, messageOf } from "../../shared/ipc";
 import { Icon } from "../../shared/ui/Icon";
 import { PosterImage } from "../../shared/ui/PosterImage";
 import { dedupeItems, genreOptions, kindLabel, sortOptions } from "./catalog-utils";
+import { actionItemFromMedia, filterWatchedMovies, type MediaContextRequest } from "../library/media-actions";
 
 export function CatalogView({
   initialKind,
   onError,
   onOpen,
+  onContext,
+  watchedMovies,
+  hideWatchedMovies,
 }: {
   initialKind: MediaKind;
   onError: (message?: string) => void;
   onOpen: (item: MediaItem) => void;
+  onContext: (request: MediaContextRequest) => void;
+  watchedMovies: LibraryItem[];
+  hideWatchedMovies: boolean;
 }) {
   const [kind, setKind] = useState<MediaKind>(initialKind);
   const [sort, setSort] = useState<CatalogSort>("trending");
@@ -114,6 +121,7 @@ export function CatalogView({
   }, [hasMore, loadMore, loading]);
 
   const genres = genreOptions(kind);
+  const visibleItems = filterWatchedMovies(items, watchedMovies, hideWatchedMovies);
   return (
     <div className="catalog-view">
       <header className="catalog-header">
@@ -157,12 +165,24 @@ export function CatalogView({
         <div className="poster-grid" aria-label="Loading catalog">
           {Array.from({ length: 14 }, (_, index) => <div className="poster-skeleton" key={index} />)}
         </div>
-      ) : items.length ? (
+      ) : visibleItems.length || hasMore ? (
         <>
           <ul className="poster-grid" role="list">
-            {items.map((item, index) => (
+            {visibleItems.map((item, index) => (
               <li key={`${item.kind}:${item.id}`}>
-                <button className="media-card" onClick={() => onOpen(item)}>
+                <button
+                  className="media-card"
+                  onClick={() => onOpen(item)}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    onContext({
+                      item: actionItemFromMedia(item),
+                      x: event.clientX,
+                      y: event.clientY,
+                      continuation: false,
+                    });
+                  }}
+                >
                   <div className="poster-frame">
                     <PosterImage
                       src={item.poster_url}
@@ -185,7 +205,12 @@ export function CatalogView({
           )}
         </>
       ) : (
-        <div className="empty-state"><h2>No titles found</h2><p>Change the search or filters and try again.</p></div>
+        <div className="empty-state">
+          <h2>{items.length ? "All loaded movies are watched" : "No titles found"}</h2>
+          <p>{items.length
+            ? "Turn off Hide watched movies in Settings to show them."
+            : "Change the search or filters and try again."}</p>
+        </div>
       )}
     </div>
   );

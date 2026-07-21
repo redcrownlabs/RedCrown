@@ -20,7 +20,8 @@ expiring stream cache rather than permanent downloads.
   configurable HTTPS URL or absolute local file;
 - loopback-only, tokenized HTTP range playback;
 - FFmpeg compatibility bridging with audio-track and subtitle selection;
-- favorites, watch progress, and Popcorn Time settings/library import;
+- favorites, exact movie/episode watched state, Continue Watching, and Popcorn
+  Time settings/library import;
 - lease-aware, expiring stream cache with size-pressure eviction;
 - torrent diagnostics and optional, explicitly redacted OpenTelemetry export.
 
@@ -83,6 +84,14 @@ Tracker import is enabled initially and points to the daily public
 disable it or select another HTTPS URL or absolute local file. RedCrown caps
 imports at 1 MiB and 512 unique trackers and supplements only magnets that have
 no tracker of their own.
+
+Watched movies are hidden from Home and movie discovery by default. Change
+**Settings → Discovery → Hide watched movies** to keep them visible. Right-click
+a media card to mark a movie or currently known series as watched. Series detail
+pages retain per-episode controls, while Continue Watching offers the first
+playable regular episode not explicitly marked watched. Removing a series from
+Continue Watching does not erase its watched history and can be reversed from
+the same card context menu.
 
 ## Pre-release builds
 

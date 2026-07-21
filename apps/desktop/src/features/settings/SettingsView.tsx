@@ -232,6 +232,25 @@ export function SettingsView({
           {trackerTouched ? trackerValidation : undefined}
         </p>
       </section>
+      <section className="settings-section" aria-labelledby="discovery-heading">
+        <div className="settings-intro">
+          <div>
+            <h2 id="discovery-heading">Discovery</h2>
+            <p>Control whether completed films remain visible while browsing.</p>
+          </div>
+          <label className="switch">
+            <input
+              type="checkbox"
+              checked={draft.hide_watched_movies}
+              onChange={(event) => setDraft((current) => ({
+                ...current,
+                hide_watched_movies: event.target.checked,
+              }))}
+            />
+            <span>Hide watched movies</span>
+          </label>
+        </div>
+      </section>
       <section className="settings-section">
         <div className="settings-intro"><div><h2>Temporary stream cache</h2><p>Reusable only for a short period. Active playback is never evicted.</p></div></div>
         <div className="storage-grid">
