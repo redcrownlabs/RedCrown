@@ -1,13 +1,14 @@
 /** @vitest-environment jsdom */
 
-import { act } from "react";
+import { act, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { CatalogPage } from "../../shared/contract.generated";
+import type { CatalogPage, LibraryItem, MediaItem } from "../../shared/contract.generated";
 import { invoke } from "../../shared/ipc";
 import type { MediaContextRequest } from "../library/media-actions";
 import { CatalogView } from "./CatalogView";
+import { createCatalogSession } from "./catalog-session";
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 
@@ -35,6 +36,50 @@ class IntersectionObserverStub implements IntersectionObserver {
   }
 
   unobserve() {}
+}
+
+const noop = () => undefined;
+
+function CatalogHarness({
+  onOpen = noop,
+  onContext = noop,
+  watchedMovies = [],
+}: {
+  onOpen?: (item: MediaItem) => void;
+  onContext?: (request: MediaContextRequest) => void;
+  watchedMovies?: LibraryItem[];
+}) {
+  const [session, setSession] = useState(() => createCatalogSession("movie"));
+  return (
+    <CatalogView
+      session={session}
+      onSessionChange={setSession}
+      onError={noop}
+      onOpen={onOpen}
+      onContext={onContext}
+      watchedMovies={watchedMovies}
+      hideWatchedMovies
+    />
+  );
+}
+
+function CatalogDrillDownHarness() {
+  const [session, setSession] = useState(() => createCatalogSession("movie"));
+  const [details, setDetails] = useState(false);
+  if (details) {
+    return <button onClick={() => setDetails(false)}>Back to catalog</button>;
+  }
+  return (
+    <CatalogView
+      session={session}
+      onSessionChange={setSession}
+      onError={noop}
+      onOpen={() => setDetails(true)}
+      onContext={noop}
+      watchedMovies={[]}
+      hideWatchedMovies
+    />
+  );
 }
 
 describe("CatalogView", () => {
@@ -69,14 +114,7 @@ describe("CatalogView", () => {
 
     await act(async () => {
       root.render(
-        <CatalogView
-          initialKind="movie"
-          onError={vi.fn()}
-          onOpen={vi.fn()}
-          onContext={vi.fn()}
-          watchedMovies={[]}
-          hideWatchedMovies
-        />,
+        <CatalogHarness />,
       );
       await Promise.resolve();
     });
@@ -100,14 +138,7 @@ describe("CatalogView", () => {
 
     await act(async () => {
       root.render(
-        <CatalogView
-          initialKind="movie"
-          onError={vi.fn()}
-          onOpen={vi.fn()}
-          onContext={onContext}
-          watchedMovies={[]}
-          hideWatchedMovies
-        />,
+        <CatalogHarness onContext={onContext} />,
       );
       await Promise.resolve();
     });
@@ -151,20 +182,60 @@ describe("CatalogView", () => {
 
     await act(async () => {
       root.render(
-        <CatalogView
-          initialKind="movie"
-          onError={vi.fn()}
-          onOpen={vi.fn()}
-          onContext={vi.fn()}
-          watchedMovies={[{ external_id: "MOVIE-1", kind: "movie" }]}
-          hideWatchedMovies
-        />,
+        <CatalogHarness watchedMovies={[{ external_id: "MOVIE-1", kind: "movie" }]} />,
       );
       await Promise.resolve();
     });
 
     expect(container.querySelector(".media-card")).toBeNull();
     expect(container.textContent).toContain("All loaded movies are watched");
+
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  it("restores search, filters, sort, and loaded results after a details drill-down", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(<CatalogDrillDownHarness />);
+      await Promise.resolve();
+    });
+
+    const search = container.querySelector<HTMLInputElement>('input[type="search"]');
+    const sort = container.querySelector<HTMLSelectElement>('select[aria-label="Sort catalog"]');
+    const genre = container.querySelector<HTMLSelectElement>('select[aria-label="Filter by genre"]');
+    await act(async () => {
+      if (!search || !sort || !genre) throw new Error("catalog controls missing");
+      const inputValueDescriptor = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value",
+      );
+      if (!inputValueDescriptor?.set) throw new Error("input value setter missing");
+      inputValueDescriptor.set.call(search, "silo");
+      search.dispatchEvent(new Event("input", { bubbles: true }));
+      sort.value = "rating";
+      sort.dispatchEvent(new Event("change", { bubbles: true }));
+      genre.value = "drama";
+      genre.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const requestsBeforeDrillDown = vi.mocked(invoke).mock.calls.length;
+    act(() => container.querySelector<HTMLButtonElement>(".media-card")?.click());
+    expect(container.textContent).toContain("Back to catalog");
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("button")?.click();
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector<HTMLInputElement>('input[type="search"]')?.value).toBe("silo");
+    expect(container.querySelector<HTMLSelectElement>('select[aria-label="Sort catalog"]')?.value).toBe("rating");
+    expect(container.querySelector<HTMLSelectElement>('select[aria-label="Filter by genre"]')?.value).toBe("drama");
+    expect(container.querySelector(".media-card")).not.toBeNull();
+    expect(vi.mocked(invoke)).toHaveBeenCalledTimes(requestsBeforeDrillDown);
 
     act(() => root.unmount());
     container.remove();

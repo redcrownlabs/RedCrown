@@ -1,4 +1,4 @@
-import { startTransition, useCallback, useEffect, useState } from "react";
+import { startTransition, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import type { BootstrapState, CatalogPage, CatalogQuery, LibraryEpisode, LibrarySummary, MediaEpisode, MediaItem, MediaKind, PlaybackStatus, TorrentOption } from "../shared/contract.generated";
 import {
@@ -11,6 +11,7 @@ import {
 import { hasConfiguredCatalog } from "../features/settings/settings-model";
 import { CatalogView } from "../features/catalog/CatalogView";
 import { catalogQuery } from "../features/catalog/catalog-utils";
+import { createCatalogSession } from "../features/catalog/catalog-session";
 import { DetailsView } from "../features/details/DetailsView";
 import { DiagnosticsView } from "../features/diagnostics/DiagnosticsView";
 import { HomeView } from "../features/home/HomeView";
@@ -39,7 +40,7 @@ export function App() {
   const [homeSections, setHomeSections] = useState<HomeSection[]>([]);
   const [continueWatching, setContinueWatching] = useState<HomeSection>();
   const [view, setView] = useState<View>("home");
-  const [catalogKind, setCatalogKind] = useState<MediaKind>("movie");
+  const [catalogSession, setCatalogSession] = useState(() => createCatalogSession("movie"));
   const [detailsReturnView, setDetailsReturnView] = useState<View>("home");
   const [detailsEpisode, setDetailsEpisode] = useState<LibraryEpisode>();
   const [selected, setSelected] = useState<MediaItem>();
@@ -48,6 +49,8 @@ export function App() {
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(true);
   const [mediaContext, setMediaContext] = useState<MediaContextRequest>();
+  const mainSurfaceRef = useRef<HTMLElement>(null);
+  const pendingScrollTopRef = useRef<number | undefined>(undefined);
   const watchedMovies = library?.watched_movies ?? [];
   const hideWatchedMovies = bootstrap?.settings.hide_watched_movies ?? true;
   const visibleHomeSections = [continueWatching, ...homeSections]
@@ -162,7 +165,17 @@ export function App() {
     };
   }, [refreshHome]);
 
-  const navigate = (next: View) => startTransition(() => setView(next));
+  const navigate = (next: View, scrollTop = 0) => {
+    pendingScrollTopRef.current = scrollTop;
+    startTransition(() => setView(next));
+  };
+
+  useLayoutEffect(() => {
+    const scrollTop = pendingScrollTopRef.current;
+    if (scrollTop == null || !mainSurfaceRef.current) return;
+    mainSurfaceRef.current.scrollTop = scrollTop;
+    pendingScrollTopRef.current = undefined;
+  }, [view]);
 
   useEffect(() => {
     function toggleDiagnostics(event: KeyboardEvent) {
@@ -179,15 +192,29 @@ export function App() {
   }, [playback]);
 
   function openCatalog(kind: MediaKind) {
-    setCatalogKind(kind);
-    navigate("catalog");
+    const scrollTop = catalogSession.kind === kind ? catalogSession.scrollTop : 0;
+    if (catalogSession.kind !== kind) {
+      setCatalogSession(createCatalogSession(kind));
+    }
+    navigate("catalog", scrollTop);
   }
 
   function openDetails(item: MediaItem, from: View, episode?: LibraryEpisode) {
+    if (from === "catalog") {
+      const scrollTop = mainSurfaceRef.current?.scrollTop ?? catalogSession.scrollTop;
+      setCatalogSession((current) => ({ ...current, scrollTop }));
+    }
     setSelected(item);
     setDetailsEpisode(episode);
     setDetailsReturnView(from);
     navigate("details");
+  }
+
+  function returnFromDetails() {
+    navigate(
+      detailsReturnView,
+      detailsReturnView === "catalog" ? catalogSession.scrollTop : 0,
+    );
   }
 
   async function setMovieWatched(request: MediaContextRequest, watched: boolean) {
@@ -329,7 +356,7 @@ export function App() {
           <button className={view === "library" ? "active" : ""} onClick={() => navigate("library")}>My library</button>
         </nav>
         <div className="top-actions">
-          <button className="icon-button" onClick={() => navigate("catalog")} aria-label="Search catalog"><Icon name="search" /></button>
+          <button className="icon-button" onClick={() => navigate("catalog", catalogSession.scrollTop)} aria-label="Search catalog"><Icon name="search" /></button>
           <button
             className={`icon-button${view === "diagnostics" ? " active" : ""}`}
             onClick={() => navigate("diagnostics")}
@@ -343,7 +370,7 @@ export function App() {
         <WindowControls />
       </header>
 
-      <main className="main-surface" id="main-content" tabIndex={-1}>
+      <main className="main-surface" id="main-content" ref={mainSurfaceRef} tabIndex={-1}>
         {error && (
           <div className="error-banner" role="alert">
             <span>{error}</span>
@@ -362,7 +389,8 @@ export function App() {
         )}
         {view === "catalog" && (
           <CatalogView
-            initialKind={catalogKind}
+            session={catalogSession}
+            onSessionChange={setCatalogSession}
             onError={setError}
             onOpen={(item) => openDetails(item, "catalog")}
             onContext={setMediaContext}
@@ -377,7 +405,7 @@ export function App() {
             busy={busy}
             initialEpisode={detailsEpisode}
             library={library}
-            onBack={() => navigate(detailsReturnView)}
+            onBack={returnFromDetails}
             onLibraryChanged={setLibrary}
             onWatch={(source) => void watch(source)}
             onContext={setMediaContext}

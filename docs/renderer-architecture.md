@@ -52,3 +52,16 @@ interactive. Player controls occupying the titlebar height must therefore sit
 above the titlebar stacking level and declare `-webkit-app-region: no-drag` on
 the actual button. Button children do not receive pointer events; the complete
 visual hitbox belongs to the native button element.
+
+## Catalog drill-down state
+
+Opening a title is a temporary drill-down from the catalog, not a new catalog
+session. `App` therefore owns the active feature-level `CatalogSession`, while
+`CatalogView` owns transient request coordination. The session retains category,
+search text, sort, genre, loaded pages, paging state, and scroll position. Back
+from details restores that exact snapshot without re-requesting page one.
+
+Choosing another primary category starts a fresh session for that category.
+This distinction prevents stale cross-category filters while preserving the
+user's place during title inspection. The state is intentionally in memory: it
+belongs to the current navigation session and is not a durable user preference.

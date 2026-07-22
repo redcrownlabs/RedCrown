@@ -1,52 +1,53 @@
 import { useCallback, useDeferredValue, useEffect, useRef, useState } from "react";
-import type { CatalogPage, CatalogSort, LibraryItem, MediaItem, MediaKind } from "../../shared/contract.generated";
+import type { CatalogPage, CatalogSort, LibraryItem, MediaItem } from "../../shared/contract.generated";
 import { invoke, messageOf } from "../../shared/ipc";
 import { Icon } from "../../shared/ui/Icon";
 import { PosterImage } from "../../shared/ui/PosterImage";
 import { dedupeItems, genreOptions, kindLabel, sortOptions } from "./catalog-utils";
 import { actionItemFromMedia, filterWatchedMovies, type MediaContextRequest } from "../library/media-actions";
+import {
+  catalogQueryKey,
+  createCatalogSession,
+  type CatalogSession,
+  type CatalogSessionUpdate,
+} from "./catalog-session";
 
 export function CatalogView({
-  initialKind,
+  session,
+  onSessionChange,
   onError,
   onOpen,
   onContext,
   watchedMovies,
   hideWatchedMovies,
 }: {
-  initialKind: MediaKind;
+  session: CatalogSession;
+  onSessionChange: (update: CatalogSessionUpdate) => void;
   onError: (message?: string) => void;
   onOpen: (item: MediaItem) => void;
   onContext: (request: MediaContextRequest) => void;
   watchedMovies: LibraryItem[];
   hideWatchedMovies: boolean;
 }) {
-  const [kind, setKind] = useState<MediaKind>(initialKind);
-  const [sort, setSort] = useState<CatalogSort>("trending");
-  const [genre, setGenre] = useState("");
-  const [keywords, setKeywords] = useState("");
-  const [items, setItems] = useState<MediaItem[]>([]);
-  const [page, setPage] = useState(1);
-  const [hasMore, setHasMore] = useState(true);
-  const [loading, setLoading] = useState(true);
+  const { kind, sort, genre, keywords, items, page, hasMore } = session;
   const deferredKeywords = useDeferredValue(keywords.trim());
+  const queryKey = catalogQueryKey(session, deferredKeywords);
+  const [loading, setLoading] = useState(session.loadedQueryKey !== queryKey);
   const loadAnchorRef = useRef<HTMLDivElement>(null);
   const loadingRef = useRef(false);
   const queryGenerationRef = useRef(0);
 
   useEffect(() => {
-    setKind(initialKind);
-    setGenre("");
-    setSort("trending");
-  }, [initialKind]);
-
-  useEffect(() => {
+    if (session.loadedQueryKey === queryKey) {
+      loadingRef.current = false;
+      setLoading(false);
+      return;
+    }
     let active = true;
     const generation = queryGenerationRef.current + 1;
     queryGenerationRef.current = generation;
     loadingRef.current = true;
     setLoading(true);
-    setPage(1);
     void invoke<CatalogPage>("catalog.browse", {
       kind,
       page: 1,
@@ -56,14 +57,21 @@ export function CatalogView({
     })
       .then((result) => {
         if (!active) return;
-        setItems(dedupeItems(result.items));
-        setHasMore(result.has_more);
+        onSessionChange((current) =>
+          catalogQueryKey(current, current.keywords.trim()) === queryKey
+            ? {
+                ...current,
+                items: dedupeItems(result.items),
+                page: result.page,
+                hasMore: result.has_more,
+                loadedQueryKey: queryKey,
+              }
+            : current,
+        );
         onError(undefined);
       })
       .catch((reason: unknown) => {
         if (!active) return;
-        setItems([]);
-        setHasMore(false);
         onError(messageOf(reason));
       })
       .finally(() => {
@@ -75,7 +83,7 @@ export function CatalogView({
     return () => {
       active = false;
     };
-  }, [deferredKeywords, genre, kind, onError, sort]);
+  }, [deferredKeywords, genre, kind, onError, onSessionChange, queryKey, session.loadedQueryKey, sort]);
 
   const loadMore = useCallback(async () => {
     if (loadingRef.current || !hasMore) return;
@@ -92,9 +100,16 @@ export function CatalogView({
         keywords: deferredKeywords || undefined,
       });
       if (queryGenerationRef.current !== generation) return;
-      setItems((current) => dedupeItems([...current, ...result.items]));
-      setPage(result.page);
-      setHasMore(result.has_more);
+      onSessionChange((current) =>
+        current.loadedQueryKey === queryKey
+          ? {
+              ...current,
+              items: dedupeItems([...current.items, ...result.items]),
+              page: result.page,
+              hasMore: result.has_more,
+            }
+          : current,
+      );
       onError(undefined);
     } catch (reason) {
       if (queryGenerationRef.current !== generation) return;
@@ -105,7 +120,7 @@ export function CatalogView({
         setLoading(false);
       }
     }
-  }, [deferredKeywords, genre, hasMore, kind, onError, page, sort]);
+  }, [deferredKeywords, genre, hasMore, kind, onError, onSessionChange, page, queryKey, sort]);
 
   useEffect(() => {
     const anchor = loadAnchorRef.current;
@@ -132,9 +147,7 @@ export function CatalogView({
         <div className="category-tabs" aria-label="Catalog category">
           {(["movie", "series", "anime"] as const).map((option) => (
             <button className={kind === option ? "active" : ""} key={option} onClick={() => {
-              setKind(option);
-              setGenre("");
-              setSort("trending");
+              onSessionChange(() => createCatalogSession(option));
             }}>{kindLabel(option)}</button>
           ))}
         </div>
@@ -143,18 +156,27 @@ export function CatalogView({
         <label className="catalog-search">
           <span className="sr-only">Search {kindLabel(kind).toLowerCase()}</span>
           <Icon name="search" />
-          <input type="search" value={keywords} onChange={(event) => setKeywords(event.target.value)} placeholder={`Search ${kindLabel(kind).toLowerCase()}`} />
+          <input type="search" value={keywords} onChange={(event) => {
+            const value = event.target.value;
+            onSessionChange((current) => ({ ...current, keywords: value }));
+          }} placeholder={`Search ${kindLabel(kind).toLowerCase()}`} />
         </label>
         <label className="compact-filter">
           <span>Sort</span>
-          <select className="branded-select" aria-label="Sort catalog" value={sort} onChange={(event) => setSort(event.target.value as CatalogSort)}>
+          <select className="branded-select" aria-label="Sort catalog" value={sort} onChange={(event) => {
+            const value = event.target.value as CatalogSort;
+            onSessionChange((current) => ({ ...current, sort: value }));
+          }}>
             {sortOptions(kind).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
           </select>
         </label>
         {kind !== "anime" && (
           <label className="compact-filter">
             <span>Genre</span>
-            <select className="branded-select" aria-label="Filter by genre" value={genre} onChange={(event) => setGenre(event.target.value)}>
+            <select className="branded-select" aria-label="Filter by genre" value={genre} onChange={(event) => {
+              const value = event.target.value;
+              onSessionChange((current) => ({ ...current, genre: value }));
+            }}>
               <option value="">All genres</option>
               {genres.map((option) => <option value={option.toLowerCase()} key={option}>{option}</option>)}
             </select>

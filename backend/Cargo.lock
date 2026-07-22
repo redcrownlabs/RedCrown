@@ -2987,7 +2987,7 @@ dependencies = [
 
 [[package]]
 name = "redcrown-catalog"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "async-trait",
  "axum",
@@ -3003,7 +3003,7 @@ dependencies = [
 
 [[package]]
 name = "redcrown-core"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "backtrace",
  "serde",
@@ -3014,7 +3014,7 @@ dependencies = [
 
 [[package]]
 name = "redcrown-desktop"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "directories",
@@ -3035,7 +3035,7 @@ dependencies = [
 
 [[package]]
 name = "redcrown-diagnostics"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "backtrace",
  "opentelemetry",
@@ -3049,7 +3049,7 @@ dependencies = [
 
 [[package]]
 name = "redcrown-library"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "directories",
  "rusqlite",
@@ -3061,7 +3061,7 @@ dependencies = [
 
 [[package]]
 name = "redcrown-torrent"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "axum",
  "backtrace",
